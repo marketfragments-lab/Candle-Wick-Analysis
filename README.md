@@ -19,7 +19,7 @@ The goal of this project is to foster collaboration and new ideas through analys
 - Potential use cases or additional features to expand its applicability.
 - Optimization opportunities for better performance or accuracy.
 - Whether it aligns better with physical or financial wick simulations.
-
+- Join marketfragments.com to have a complete discussion
 ---
 
 ## 🏗️ Installation and Setup
