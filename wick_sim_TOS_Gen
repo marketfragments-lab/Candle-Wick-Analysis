@@ -1,0 +1,570 @@
+
+import pandas as pd
+import os
+import re
+from datetime import datetime
+import logging
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Configuration
+CONFIG = {
+    'results_dir': 'results',
+    'output_script_path': 'results/ES5_ThinkOrSwim_Script.txt'
+}
+
+def parse_rule_code(rule_code):
+    """Parses a rule code string into a dictionary of parameters."""
+    try:
+        pattern = r"ET:([^|]+)\|WP:([^|]+)\|MC:([^|]+)\|VL:([^|]+)\|TP:([^|]+)\|SL:([^|]+)\|WC:([^|]+)\|TF:([^|]+)\|NT:([^|]+)\|BT:([^|]+)\|WT:([^|]+)\|PT:([^|]+)"
+        match = re.match(pattern, rule_code)
+        if not match:
+            logger.warning(f"Invalid rule code format: {rule_code}")
+            return None
+        return {
+            'entry_trigger': match.group(1),
+            'wick_position': match.group(2),
+            'market_condition': match.group(3),
+            'volume_level': match.group(4),
+            'take_profit_pct': float(match.group(5)),
+            'stop_loss_pct': float(match.group(6)),
+            'wick_confidence': float(match.group(7)),
+            'timeframe': match.group(8),
+            'num_trades': int(match.group(9)),
+            'body_size_threshold': float(match.group(10)),
+            'wick_size_threshold': float(match.group(11)),
+            'position_type': match.group(12)
+        }
+    except Exception as e:
+        logger.error(f"Error parsing rule code {rule_code}: {e}")
+        return None
+
+def generate_tos_script(top_df, num_strategies=8):
+    """Generates a Thinkorswim script for the top strategies."""
+    if top_df.empty:
+        logger.warning("No strategies provided for ToS script generation.")
+        return "# No valid strategies found."
+
+    # Ensure we have at least num_strategies, but cap at available rows
+    top_df = top_df.head(num_strategies)
+    if len(top_df) < 5:
+        logger.warning(f"Only {len(top_df)} strategies available, expected at least 5.")
+        num_strategies = len(top_df)
+
+    # Map parameters to IDs for ToS switch statement
+    symbol_map = {'ES5': 1}
+    market_condition_map = {'consolidating': 1, 'trendingUp': 2, 'trendingDown': 3, 'volatile': 4}
+    entry_trigger_map = {
+        'closeAboveLowerWick': 1, 'nextCandleOpen': 2, 'closeBelowUpperWick': 4,
+        'breakWickHighLow': 5, 'customPercentWick': 6
+    }
+    wick_position_map = {'any': 1, 'nearResistance': 2, 'nearSupport': 3}
+    volume_level_map = {'low': 1, 'high': 2, 'normal': 3}
+    position_type_map = {'long': 1, 'short': 2}
+    pattern_map = {'Hammer': 1, 'Doji': 2, 'ShootingStar': 3, 'Custom': 4, 'None': 1}
+
+    # Generate strategy names for selectedStrategy input
+    strategy_options = []
+    for idx, row in top_df.iterrows():
+        rank = idx + 1
+        symbol = row['symbol']
+        position = row['position_type']
+        market_condition = row['market_condition']
+        strategy_name = f"Rank-{rank}: {symbol} {position.capitalize()} {market_condition.capitalize()}"
+        strategy_options.append(strategy_name)
+
+    # Initialize ToS script
+    script = f"""
+# SPY Wick Strategy - Generated {datetime.now().strftime('%B %d, %Y')}
+# Rule Code Explanation: The Rule Code encodes the inputs for each setup in selfLearningTable.
+# Format: ET:[entryTrigger]|WP:[wickPosition]|MC:[marketCondition]|VL:[volumeLevel]|TP:[takeProfitPercent]|SL:[stopLossPercent]|WC:[wickConfidence]|TF:[timeframe]|NT:[numTrades]|BT:[bodySizeThreshold]|WT:[wickSizeThreshold]|PT:[positionType]
+# Example: ET:closeAboveLowerWick|WP:nearSupport|MC:ranging|VL:high|TP:4|SL:2|WC:5|TF:daily|NT:1000|BT:0.5|WT:0.5|PT:long
+
+## User Inputs for Strategy Selection
+input selectedStrategy = {{
+    {", ".join([f'"{opt}"{" default" if i == 0 else ""}' for i, opt in enumerate(strategy_options)])},
+    "None"
+}};
+
+## General Indicator Inputs
+input alma_len = 9;
+input alma_sigma = 6;
+input alma_offset = 0.85;
+input rslope_len = 14;
+input rslope_thresh = 0.005;
+input atr_len_input = 14;
+input atr_ma_len = 50;
+input TickOffsetMult = 5;
+input AtrType = {{default "Heiken", "Basic"}};
+input AdjustedATR = yes;
+input AtrMultiple = 1.1;
+input almaProximityThreshold = 0.005;
+input AtrLength = 14;
+input AtrAvgType = AverageType.WILDERS;
+
+## DBSCAN Inputs
+input eps1D = 0.5;
+input eps2D = 10.0;
+input timeScale = 10.0;
+input minPts = 4;
+input lookback_DBSCAN = 100;
+input DistanceType = {{default "Two-dimensional", "One-dimensional"}};
+
+## Volume Thresholds
+input highVolumeThreshold = 75000;
+input normalVolumeThreshold = 40000;
+input lowVolumeThreshold = 25000;
+
+DefineGlobalColor("Up", Color.UPTICK);
+DefineGlobalColor("Down", Color.DOWNTICK);
+DefineGlobalColor("Off", Color.DARK_GRAY);
+DefineGlobalColor("Off2", Color.GRAY);
+
+def h = high;
+def l = low;
+def c = close;
+def o = open;
+def v = volume;
+def bn = BarNumber();
+def nan = Double.NaN;
+
+def tickSize = If(!IsNaN(TickSize()), TickSize(), 0.01);
+def tickValue = If(!IsNaN(TickValue()), TickValue(), 0.01);
+def tickOffset = TickOffsetMult * tickSize;
+
+## Heiken Ashi Calculation
+def HAclose;
+def HAopen = CompoundValue(1, (HAopen[1] + HAclose[1]) / 2, (o[1] + c[1]) / 2);
+def HAhigh = Max(h, Max(o, c));
+def HAlow = Min(l, Min(o, c));
+HAclose = (HAopen + HAhigh + HAlow + c) / 4;
+
+def heikenATR = TrueRange(HAhigh, HAclose, HAlow);
+def basicATR = TrueRange(h, c, l);
+def tr = if AtrType == AtrType."Heiken" then heikenATR else basicATR;
+def atr = Round(MovingAverage(AtrAvgType, tr, AtrLength) / tickSize, 0) * tickSize;
+def finalAtr = if AdjustedATR then Round((atr * AtrMultiple) / tickSize, 0) * tickSize else atr;
+
+## ALMA Calculation
+def m = alma_offset * (alma_len - 1);
+def s = alma_len / alma_sigma;
+def ExpDenominator = 2 * Sqr(s);
+def SumVectorData = fold y = 0 to alma_len with WS do WS + Exp(-Sqr(y - m) / ExpDenominator) * GetValue(c, alma_len - 1 - y);
+def SumVector = fold z = 0 to alma_len with CW do CW + Exp(-Sqr(z - m) / ExpDenominator);
+plot ALMA = SumVectorData / SumVector;
+
+## General Market Condition Logic
+def regression_slope = LinearRegressionSlope(c, rslope_len);
+def isTrendingUp = ALMA > ALMA[1];
+def isTrendingDown = ALMA < ALMA[1];
+def atr_ma = MovingAverage(AtrAvgType, atr, atr_ma_len);
+def isVolatile = atr > atr_ma;
+
+## Consolidating (DBSCAN)
+def DBSCAN_Dimension;
+switch (DistanceType) {{
+case "One-dimensional":
+    DBSCAN_Dimension = 1;
+case "Two-dimensional":
+    DBSCAN_Dimension = 2;
+}}
+def DBSCAN_eps = if DBSCAN_Dimension == 1 then eps1D else eps2D;
+
+script CountNeighbors_TS {{
+    input currentClose = 0;
+    input lookback_val = 50;
+    input eps_val = 0.5;
+    input isDim_val = 1;
+    input scale_val = 10.0;
+    def neighbor_count = CompoundValue(1, fold i = 1 to lookback_val + 1
+                               with cnt = 0
+                               do if (if isDim_val == 1 then AbsValue(GetValue(close, i - 1) - currentClose)
+                                           else Sqrt(Sqr((i - 1) / scale_val) + Sqr(GetValue(close, i - 1) - currentClose))) <= eps_val
+                                   then cnt + 1
+                                   else cnt, 0);
+    plot count_val = neighbor_count;
+}}
+def isConsolidatingMarket = if CountNeighbors_TS(c, lookback_DBSCAN, DBSCAN_eps, DBSCAN_Dimension, timeScale) >= minPts then yes else no;
+
+## General Candle Pattern Logic
+def range_val = h - l;
+def body_val = AbsValue(c - o);
+def upper_wick_val = h - Max(o, c);
+def lower_wick_val = Min(o, c) - l;
+
+def BODY_SIZE_THRESHOLD_CALC;
+def WICK_SIZE_THRESHOLD_CALC;
+
+## General Wick Position Logic
+def isNearSupport = (ALMA - l) / ALMA >= -almaProximityThreshold and (ALMA - l) / ALMA <= almaProximityThreshold * 2;
+def isNearResistance = (h - ALMA) / ALMA >= -almaProximityThreshold * 2 and (h - ALMA) / ALMA <= almaProximityThreshold;
+def isAnyWickPosition = yes;
+
+## General Volume Level Logic
+def isVolumeHigh = v > highVolumeThreshold;
+def isVolumeNormal = v > normalVolumeThreshold;
+def isVolumeLow = v > lowVolumeThreshold;
+
+## Strategy Parameter Selection Switch
+def symbol_id; # 1=SPY
+def market_condition_id; # 1=Consolidating, 2=TrendingUp, 3=TrendingDown, 4=Volatile
+def entry_trigger_id; # 1=closeAboveLowerWick, 2=nextCandleOpen, 4=closeBelowUpperWick, 5=breakWickHighLow, 6=customPercentWick
+def wick_position_id; # 1=any, 2=nearResistance, 3=nearSupport
+def volume_level_id; # 1=low, 2=high, 3=normal
+def position_type_id; # 1=Long, 2=Short
+def pattern_id; # 1=Hammer, 2=Doji, 3=ShootingStar, 4=Custom
+
+def current_body_size_threshold_val;
+def current_wick_size_threshold_val;
+def current_take_profit_pct_val;
+def current_stop_loss_pct_val;
+
+def strategy_market_condition_met;
+def strategy_volume_level_met;
+def strategy_candle_pattern_met;
+def strategy_wick_position_met;
+def strategy_entry_trigger_met;
+def strategy_position_long;
+def strategy_position_short;
+
+switch (selectedStrategy) {{
+"""
+
+    # Add strategy cases
+    for idx, row in top_df.iterrows():
+        rank = idx + 1
+        strategy_name = f"Rank-{rank}: {row['symbol']} {row['position_type'].capitalize()} {row['market_condition'].capitalize()}"
+        symbol_id = symbol_map.get(row['symbol'], 1)
+        market_condition_id = market_condition_map.get(row['market_condition'], 1)
+        entry_trigger_id = entry_trigger_map.get(row['entry_trigger'], 1)
+        wick_position_id = wick_position_map.get(row['wick_position'], 1)
+        volume_level_id = volume_level_map.get(row['volume_level'], 1)
+        position_type_id = position_type_map.get(row['position_type'], 1)
+        pattern_id = pattern_map.get(row['pattern'], 4)
+        body_size_threshold = row['body_size_threshold']
+        wick_size_threshold = row['wick_size_threshold']
+        take_profit_pct = row['take_profit_pct']
+        stop_loss_pct = row['stop_loss_pct']
+
+        script += f"""
+case "{strategy_name}":
+    symbol_id = {symbol_id}; # {row['symbol']}
+    market_condition_id = {market_condition_id}; # {row['market_condition']}
+    entry_trigger_id = {entry_trigger_id}; # {row['entry_trigger']}
+    wick_position_id = {wick_position_id}; # {row['wick_position']}
+    volume_level_id = {volume_level_id}; # {row['volume_level']}
+    position_type_id = {position_type_id}; # {row['position_type']}
+    current_body_size_threshold_val = {body_size_threshold};
+    current_wick_size_threshold_val = {wick_size_threshold};
+    current_take_profit_pct_val = {take_profit_pct};
+    current_stop_loss_pct_val = {stop_loss_pct};
+    pattern_id = {pattern_id}; # {row['pattern']}
+
+    strategy_market_condition_met = {"isConsolidatingMarket" if row['market_condition'] == 'consolidating' else 'isTrendingUp' if row['market_condition'] == 'trendingUp' else 'isTrendingDown' if row['market_condition'] == 'trendingDown' else 'isVolatile'};
+    strategy_volume_level_met = {"isVolumeLow" if row['volume_level'] == 'low' else 'isVolumeHigh' if row['volume_level'] == 'high' else 'isVolumeNormal'};
+    strategy_wick_position_met = {"isAnyWickPosition" if row['wick_position'] == 'any' else 'isNearResistance' if row['wick_position'] == 'nearResistance' else 'isNearSupport'};
+    strategy_entry_trigger_met = {
+        'c > l + (h - l) * (1 - current_wick_size_threshold_val)' if row['entry_trigger'] == 'closeAboveLowerWick' else
+        'c < h - (h - l) * (1 - current_wick_size_threshold_val)' if row['entry_trigger'] == 'closeBelowUpperWick' else
+        'c > h[1]' if row['entry_trigger'] == 'breakWickHighLow' else
+        'o[1] > c' if row['entry_trigger'] == 'nextCandleOpen' else
+        'c > l + 0.3 * (h - l)' if row['entry_trigger'] == 'customPercentWick' else 'yes'
+    };
+    strategy_position_long = {"yes" if row['position_type'] == 'long' else "no"};
+    strategy_position_short = {"yes" if row['position_type'] == 'short' else "no"};
+"""
+
+    # Complete the switch statement and add remaining logic
+    script += f"""
+default:
+    symbol_id = 0;
+    market_condition_id = 0;
+    entry_trigger_id = 0;
+    wick_position_id = 0;
+    volume_level_id = 0;
+    position_type_id = 0;
+    current_body_size_threshold_val = 0.5;
+    current_wick_size_threshold_val = 0.5;
+    current_take_profit_pct_val = 5.0;
+    current_stop_loss_pct_val = 1.0;
+    pattern_id = 0;
+    strategy_market_condition_met = no;
+    strategy_volume_level_met = no;
+    strategy_wick_position_met = no;
+    strategy_entry_trigger_met = no;
+    strategy_position_long = no;
+    strategy_position_short = no;
+}}
+
+BODY_SIZE_THRESHOLD_CALC = current_body_size_threshold_val;
+WICK_SIZE_THRESHOLD_CALC = current_wick_size_threshold_val;
+
+def body_cond_met_any_val = body_val <= BODY_SIZE_THRESHOLD_CALC * range_val;
+def lower_wick_cond_met_ws_val = lower_wick_val >= WICK_SIZE_THRESHOLD_CALC * body_val;
+def upper_wick_cond_met_ws_val = upper_wick_val >= WICK_SIZE_THRESHOLD_CALC * body_val;
+def isHammerPattern_val = body_cond_met_any_val and lower_wick_val > 2 * body_val and upper_wick_val < 0.1 * range_val and c > o and v > {"highVolumeThreshold" if row['volume_level'] == 'high' else 'normalVolumeThreshold' if row['volume_level'] == 'normal' else 'lowVolumeThreshold'};
+def doji_wick_balance_met_val = AbsValue(upper_wick_val - lower_wick_val) <= 0.2 * range_val;
+def isDojiPattern_val = body_val < 0.1 * range_val and doji_wick_balance_met_val;
+def isShootingStarPattern_val = body_cond_met_any_val and upper_wick_val > 2 * body_val and lower_wick_val < 0.1 * range_val and c < o and v > {"highVolumeThreshold" if row['volume_level'] == 'high' else 'normalVolumeThreshold' if row['volume_level'] == 'normal' else 'lowVolumeThreshold'};
+def isCustomPattern_val = body_cond_met_any_val and (lower_wick_cond_met_ws_val or upper_wick_cond_met_ws_val);
+
+if pattern_id == 1 {{ # Hammer
+    strategy_candle_pattern_met = isHammerPattern_val;
+}} else if pattern_id == 2 {{ # Doji
+    strategy_candle_pattern_met = isDojiPattern_val;
+}} else if pattern_id == 3 {{ # ShootingStar
+    strategy_candle_pattern_met = isShootingStarPattern_val;
+}} else if pattern_id == 4 {{ # Custom
+    strategy_candle_pattern_met = isCustomPattern_val;
+}} else {{
+    strategy_candle_pattern_met = no;
+}}
+
+## Combined Entry Signal
+def LongEntrySignal;
+def triggerLongEntryThisBar = strategy_market_condition_met and strategy_volume_level_met and strategy_candle_pattern_met and strategy_wick_position_met;
+
+if strategy_position_long {{
+    if entry_trigger_id == 1 {{ # closeAboveLowerWick
+        LongEntrySignal = if triggerLongEntryThisBar and (c > l + (h - l) * (1 - current_wick_size_threshold_val)) then c else nan;
+    }} else if entry_trigger_id == 4 {{ # closeBelowUpperWick
+        LongEntrySignal = if triggerLongEntryThisBar and (c < h - (h - l) * (1 - current_wick_size_threshold_val)) then c else nan;
+    }} else if entry_trigger_id == 2 {{ # nextCandleOpen
+        LongEntrySignal = if triggerLongEntryThisBar[1] then o else nan;
+    }} else if entry_trigger_id == 5 {{ # breakWickHighLow
+        LongEntrySignal = if triggerLongEntryThisBar[1] and c > h[1] then c else nan;
+    }} else if entry_trigger_id == 6 {{ # customPercentWick
+        LongEntrySignal = if triggerLongEntryThisBar and (c > l + 0.3 * (h - l)) then c else nan;
+    }} else {{
+        LongEntrySignal = nan;
+    }}
+}} else {{
+    LongEntrySignal = nan;
+}}
+
+def ShortEntrySignal;
+def triggerShortEntryThisBar = strategy_market_condition_met and strategy_volume_level_met and strategy_candle_pattern_met and strategy_wick_position_met;
+
+if strategy_position_short {{
+    if entry_trigger_id == 4 {{ # closeBelowUpperWick
+        ShortEntrySignal = if triggerShortEntryThisBar and (c < h - (h - l) * (1 - current_wick_size_threshold_val)) then c else nan;
+    }} else if entry_trigger_id == 2 {{ # nextCandleOpen
+        ShortEntrySignal = if triggerShortEntryThisBar[1] then o else nan;
+    }} else if entry_trigger_id == 5 {{ # breakWickHighLow
+        ShortEntrySignal = if triggerShortEntryThisBar[1] and l < l[1] then Min(l[1], o) else nan;
+    }} else if entry_trigger_id == 6 {{ # customPercentWick
+        ShortEntrySignal = if triggerShortEntryThisBar and (c > l + 0.3 * (h - l)) then c else nan;
+    }} else {{
+        ShortEntrySignal = nan;
+    }}
+}} else {{
+    ShortEntrySignal = nan;
+}}
+
+## Trade Mechanics
+def BTOopen;
+def STOopen;
+def trdi;
+if bn == 1 {{
+    trdi = 0;
+}} else if (BTOopen[1] && !STOopen[1]) {{
+    trdi = 1;
+}} else if (!BTOopen[1] && trdi[1] == 1) {{
+    trdi = 0;
+}} else if (STOopen[1] && trdi[1] != -1) {{
+    trdi = -1;
+}} else if (!STOopen[1] && trdi[1] == -1) {{
+    trdi = 0;
+}} else {{
+    trdi = trdi[1];
+}}
+
+def longsig;
+def longEntry;
+def longTGT;
+def buystop;
+def shortsig;
+def shortentry;
+def shortTGT;
+def sellstop;
+
+if (!trdi && !IsNaN(LongEntrySignal)) {{
+    longsig = 1;
+    longEntry = if longsig && !longsig[1] then c else longEntry[1];
+    longTGT = if longsig && !longsig[1] then longEntry * (1 + current_take_profit_pct_val / 100) else longTGT[1];
+    buystop = if longsig && !longsig[1] then longEntry * (1 - current_stop_loss_pct_val / 100) else buystop[1];
+    BTOopen = if bn == 1 then 0
+              else if longsig && !longsig[1] && BTOopen[1] == 0 then 2
+              else if c <= buystop[1] && BTOopen[1] == 2 then 0
+              else if h >= longTGT[1] && BTOopen[1] == 2 then 0
+              else BTOopen[1];
+}} else {{
+    longsig = 0;
+    longEntry = if longsig && !longsig[1] then c else longEntry[1];
+    longTGT = if longsig && !longsig[1] then longEntry * (1 + current_take_profit_pct_val / 100) else longTGT[1];
+    buystop = if longsig && !longsig[1] then longEntry * (1 - current_stop_loss_pct_val / 100) else buystop[1];
+    BTOopen = if bn == 1 then 0
+              else if longsig && !longsig[1] && BTOopen[1] == 0 then 2
+              else if c <= buystop[1] && BTOopen[1] == 2 then 0
+              else if h >= longTGT[1] && BTOopen[1] == 2 then 0
+              else BTOopen[1];
+}}
+
+if (!trdi && !IsNaN(ShortEntrySignal)) {{
+    shortsig = 1;
+    shortentry = if shortsig && !shortsig[1] then c else shortentry[1];
+    shortTGT = if shortsig && !shortsig[1] then shortentry * (1 - current_take_profit_pct_val / 100) else shortTGT[1];
+    sellstop = if shortsig && !shortsig[1] then shortentry * (1 + current_stop_loss_pct_val / 100) else sellstop[1];
+    STOopen = if bn == 1 then 0
+              else if shortsig && !shortsig[1] && STOopen[1] == 0 then 2
+              else if l <= shortTGT && STOopen[1] == 2 then 0
+              else if c >= sellstop && STOopen[1] == 2 then 0
+              else STOopen[1];
+}} else {{
+    shortsig = 0;
+    shortentry = if shortsig && !shortsig[1] then c else shortentry[1];
+    shortTGT = if shortsig && !shortsig[1] then shortentry * (1 - current_take_profit_pct_val / 100) else shortTGT[1];
+    sellstop = if shortsig && !shortsig[1] then shortentry * (1 + current_stop_loss_pct_val / 100) else sellstop[1];
+    STOopen = if bn == 1 then 0
+              else if shortsig && !shortsig[1] && STOopen[1] == 0 then 2
+              else if l <= shortTGT && STOopen[1] == 2 then 0
+              else if c >= sellstop && STOopen[1] == 2 then 0
+              else STOopen[1];
+}}
+
+## Aliases for Plotting
+def lEp = longEntry;
+def lStopLossPrice = buystop;
+def lTakeProfitPrice = longTGT;
+def sEp = shortentry;
+def sStopLossPrice = sellstop;
+def sTakeProfitPrice = shortTGT;
+
+def BTO = If(BTOopen == 2 && BTOopen[1] != 2, c, nan);
+def STC = If(BTOopen != 2 && BTOopen[1] == 2, c, nan);
+def STO = If(STOopen == 2 && STOopen[1] != 2, c, nan);
+def BTC = If(STOopen != 2 && STOopen[1] == 2, c, nan);
+
+## Plots
+plot entryBTO = if BTOopen and !BTOopen[1] then low else nan;
+entryBTO.AssignValueColor(Color.GREEN);
+entryBTO.SetPaintingStrategy(PaintingStrategy.BOOLEAN_ARROW_UP);
+
+plot exitSTC = if !BTOopen and BTOopen[1] then close else nan;
+exitSTC.AssignValueColor(Color.RED);
+exitSTC.SetPaintingStrategy(PaintingStrategy.BOOLEAN_ARROW_DOWN);
+
+plot LongEntryPricePlot = if BTOopen == 2 then lEp else nan;
+LongEntryPricePlot.SetDefaultColor(Color.YELLOW);
+LongEntryPricePlot.SetPaintingStrategy(PaintingStrategy.HORIZONTAL);
+
+plot LongStopPlot = if BTOopen == 2 then lStopLossPrice else nan;
+LongStopPlot.SetDefaultColor(Color.RED);
+LongStopPlot.SetPaintingStrategy(PaintingStrategy.HORIZONTAL);
+
+plot LongTargetPlot = if BTOopen == 2 then lTakeProfitPrice else nan;
+LongTargetPlot.SetDefaultColor(Color.GREEN);
+LongTargetPlot.SetPaintingStrategy(PaintingStrategy.HORIZONTAL);
+
+plot entrySTO = if STOopen and !STOopen[1] then high else nan;
+entrySTO.AssignValueColor(Color.ORANGE);
+entrySTO.SetPaintingStrategy(PaintingStrategy.BOOLEAN_ARROW_DOWN);
+
+plot exitBTC = if !STOopen and STOopen[1] then close else nan;
+exitBTC.AssignValueColor(Color.BLUE);
+exitBTC.SetPaintingStrategy(PaintingStrategy.BOOLEAN_ARROW_UP);
+
+plot ShortEntryPricePlot = if STOopen == 2 then sEp else nan;
+ShortEntryPricePlot.SetDefaultColor(Color.YELLOW);
+ShortEntryPricePlot.SetPaintingStrategy(PaintingStrategy.HORIZONTAL);
+
+plot ShortStopPlot = if STOopen == 2 then sStopLossPrice else nan;
+ShortStopPlot.SetDefaultColor(Color.RED);
+ShortStopPlot.SetPaintingStrategy(PaintingStrategy.HORIZONTAL);
+
+plot ShortTargetPlot = if STOopen == 2 then sTakeProfitPrice else nan;
+ShortTargetPlot.SetDefaultColor(Color.GREEN);
+ShortTargetPlot.SetPaintingStrategy(PaintingStrategy.HORIZONTAL);
+
+## Labels
+AddLabel(1, "Selected Strategy: " + selectedStrategy, Color.WHITE);
+AddLabel(1, "Symbol (Intended): SPY", Color.WHITE);
+AddLabel(1, "Timeframe (Intended): Daily", Color.WHITE);
+AddLabel(1, "Market: " +
+    if market_condition_id == 1 then "Consolidating"
+    else if market_condition_id == 2 then "TrendingUp"
+    else if market_condition_id == 3 then "TrendingDown"
+    else if market_condition_id == 4 then "Volatile"
+    else "N/A", Color.CYAN);
+AddLabel(1, "Pattern: " +
+    if pattern_id == 1 then "Hammer"
+    else if pattern_id == 2 then "Doji"
+    else if pattern_id == 3 then "ShootingStar"
+    else if pattern_id == 4 then "Custom"
+    else "N/A", Color.CYAN);
+AddLabel(1, "Wick Pos: " +
+    if wick_position_id == 1 then "any"
+    else if wick_position_id == 2 then "nearResistance"
+    else if wick_position_id == 3 then "nearSupport"
+    else "N/A", Color.CYAN);
+AddLabel(1, "Volume: " +
+    if volume_level_id == 1 then "low"
+    else if volume_level_id == 2 then "high"
+    else if volume_level_id == 3 then "normal"
+    else "N/A", Color.CYAN);
+AddLabel(1, "Entry: " +
+    if entry_trigger_id == 1 then "closeAboveLowerWick"
+    else if entry_trigger_id == 2 then "nextCandleOpen"
+    else if entry_trigger_id == 4 then "closeBelowUpperWick"
+    else if entry_trigger_id == 5 then "breakWickHighLow"
+    else if entry_trigger_id == 6 then "customPercentWick"
+    else "N/A", Color.CYAN);
+
+AddLabel(BTOopen == 2, "LONG TRADE OPEN (" + AsDollars(lEp) + ")", Color.GREEN);
+AddLabel(BTOopen == 2, "SL: " + AsDollars(lStopLossPrice), Color.RED);
+AddLabel(BTOopen == 2, "TP: " + AsDollars(lTakeProfitPrice), Color.GREEN);
+
+AddLabel(STOopen == 2, "SHORT TRADE OPEN (" + AsDollars(sEp) + ")", Color.ORANGE);
+AddLabel(STOopen == 2, "SL: " + AsDollars(sStopLossPrice), Color.RED);
+AddLabel(STOopen == 2, "TP: " + AsDollars(sTakeProfitPrice), Color.GREEN);
+"""
+    return script.strip()
+
+
+def main():
+    """Main function to generate ToS script from Top Patterns strategies."""
+    logger.info("Starting ToS script generation for ES5 strategies")
+    os.makedirs(CONFIG['results_dir'], exist_ok=True)
+    output_path = CONFIG['output_script_path']
+    run_id = datetime.now().strftime("Run_%Y%m%d_%H%M%S")
+
+    # Use ES5_Top_Patterns.csv and take top 10 by combined_score
+    top_patterns_csv_path = os.path.join(CONFIG['results_dir'], 'ES5_Top_Patterns.csv')
+    if not os.path.exists(top_patterns_csv_path):
+        logger.error(f"Top Patterns CSV not found at {top_patterns_csv_path}")
+        return
+    try:
+        df_top = pd.read_csv(top_patterns_csv_path)
+        logger.info(f"Loaded {len(df_top)} top patterns from {top_patterns_csv_path}")
+    except Exception as e:
+        logger.error(f"Error loading Top Patterns CSV: {e}")
+        return
+    if df_top.empty:
+        logger.error("No valid strategies found in Top Patterns CSV file. Exiting.")
+        return
+    # Take only the top 10 by combined_score (descending)
+    df_top10 = df_top.sort_values(by='combined_score', ascending=False).head(10).reset_index(drop=True)
+    tos_script = generate_tos_script(df_top10, num_strategies=10)
+    
+    # Save ToS script
+    with open(output_path, 'w') as f:
+        f.write(f"# ThinkOrSwim Script for ES5 Strategies - Run ID: {run_id}\n")
+        f.write("=" * 50 + "\n\n")
+        f.write(tos_script)
+        f.write("\n" + "-" * 40 + "\n")
+    logger.info(f"Successfully saved ToS script to {output_path}")
+
+if __name__ == "__main__":
+    main()
