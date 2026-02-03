@@ -1,0 +1,1887 @@
+"""
+MarketFragments Early Prototype v2 - ES 5-min Pattern Scanner & Backtester
+=========================================================================
+
+This is an updated version of one of my first Python trading experiments (~2022–2023).
+Started while learning Python — now cleaned up and extended with more realistic elements.
+
+Key additions in v2:
+• Realistic round-trip slippage: 0.25–0.50 points (configurable, higher in high-vol windows)
+• Commissions: $4–$5 RT per contract (configurable)
+• Replaced random win rates with sampling from actual historical OOS forward returns
+• Basic position sizing: risk 1% of equity per trade
+• Equity curve plotting with matplotlib
+
+Original goal: Explore candlestick patterns + ALMA + DBSCAN on ES futures 5-minute data.
+
+Now used as a public example / conversation starter for:
+→ https://marketfragments.com
+→ https://www.marketfragments.com/wickstrategylab  - current version in a user input form
+Feel free to fork, improve, critique, or use pieces for your own research.
+Trading is risky — always do your own due diligence.
+
+Happy coding & trade responsibly!
+
+- Adventures of a Single Dad (@LDUnbreakable)
+"""
+import pandas as pd
+import numpy as np
+import pandas_ta as ta
+import os
+import json
+import time
+import logging
+import random
+from itertools import product
+from collections import defaultdict, deque
+from sklearn.preprocessing import StandardScaler
+from sklearn.neighbors import LocalOutlierFactor
+from sklearn.model_selection import train_test_split, cross_val_score
+import lightgbm as lgb
+import catboost as cb
+import optuna
+from multiprocessing import Pool, cpu_count # Import for parallel processing
+from scipy.sparse import spmatrix # Import spmatrix for type checking
+from numba import njit
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+import psutil
+import time
+
+class CPURegulator:
+    def __init__(self, max_cpu=65):
+        self.max_cpu = max_cpu
+
+    def throttle_if_needed(self):
+        cpu = psutil.cpu_percent(interval=0.1)
+        if cpu > self.max_cpu:
+            time.sleep(0.2)  # Sleep briefly to reduce CPU usage
+
+
+# Global configuration
+CONFIG = {
+    'results_dir': 'results'
+}
+
+# Adjusted ThinkScript parameters for ES5 5-minute timeframe
+THINKSCRIPT_PARAMS = {
+    'alma_len': 14,  # Reduced for 5-minute data
+    'alma_sigma': 4,  # Adjusted for sensitivity
+    'alma_offset': 0.618,
+    'rslope_len': 23,  # Reduced for faster price movements
+    'rslope_thresh': 0.001,  # Tighter for ES futures volatility
+    'atr_len': 10,  # Reduced for faster response
+    'atr_ma_len': 30,  # Adjusted for 5-minute data
+    'tick_offset_mult': 2,  # Adjusted for ES tick size (0.25 points)
+    'atr_type': 'Heiken',
+    'adjusted_atr': True,
+    'atr_multiple': 0.8,  # Reduced for ES futures
+    'alma_proximity_threshold': 0.002,  # Tighter for ES price scale
+    'eps1D': 1,  # Aligned with ES tick size
+    'eps2D': 15,  # Adjusted for DBSCAN
+    'time_scale': 15.0,  # Adjusted for faster market changes
+    'min_pts': 4,  # Reduced for fewer points in window
+    'lookback_dbscan': 100,  # Reduced for 5-minute data
+    'high_volume_threshold': 110915,  # Higher for ES futures
+    'normal_volume_threshold': 58627,
+    'low_volume_threshold': 29313,
+    'DistanceType': 'Two-dimensional',
+}
+
+# Data file path
+DATA_FILE_PATH = os.path.join('.', '[insert text file]')
+
+def load_candlestick_data(symbol: str, years_back: int = 2) -> pd.DataFrame:
+    """
+    Loads 5-minute candlestick data for ES5.
+    Filters to the last `years_back` years for efficiency.
+    """
+    if not os.path.exists(DATA_FILE_PATH):
+        raise FileNotFoundError(f"Data file not found at '{DATA_FILE_PATH}'. Please ensure the file exists in the parent directory.")
+    logger.info(f"Loading 5-minute data from '{DATA_FILE_PATH}' for {symbol} (last {years_back} years)...")
+    try:
+        df = pd.read_csv(
+            DATA_FILE_PATH,
+            header=None,
+            names=['timestamp', 'open', 'high', 'low', 'close', 'volume'],
+            parse_dates=['timestamp'],
+            date_format='%Y-%m-%d %H:%M:%S'
+        )
+
+        required_cols = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+        if not all(col in df.columns for col in required_cols):
+            raise ValueError(f"Missing required columns: {required_cols}. Found columns: {list(df.columns)}")
+
+        df = df.dropna(subset=['timestamp'])
+        df.set_index('timestamp', inplace=True)
+        df = df.sort_index()
+
+        # Filter to last N years
+        cutoff_date = pd.Timestamp.now() - pd.DateOffset(years=years_back)
+        df = df[df.index >= cutoff_date]
+
+        # Ensure correct dtypes for numerical operations
+        try:
+            df = df.astype({
+                'open': float, 'high': float, 'low': float,
+                'close': float, 'volume': int
+            }, errors='raise')
+        except Exception as e:
+            logger.error(f"Type conversion error in candlestick data: {e}")
+            raise
+
+        df = df.dropna()
+        df = df[df['volume'] > 0]
+
+        # Cache the filtered data
+        os.makedirs("data", exist_ok=True)
+        cache_file = f"data/{symbol}_5min_raw_{years_back}y.csv"
+        df.to_csv(cache_file, index=True)
+        logger.info(f"Saved 5-minute data cache for {symbol}, rows: {len(df)} (last {years_back} years)")
+
+        return df
+    except Exception as e:
+        raise Exception(f"Error loading text file: {e}. Please check the file format (should be CSV with 6 columns: DateTime (yyyy-MM-dd HH:mm:ss), Open, High, Low, Close, Volume, no header).")
+
+def box_muller_transform():
+    u1 = np.random.uniform(0, 1)
+    u2 = np.random.uniform(0, 1)
+    R = np.sqrt(-2.0 * np.log(u1))
+    Theta = 2.0 * np.pi * u2
+    return R * np.cos(Theta)
+
+def generate_gbm_price_data(
+    initial_price=6311.00,
+    lookback=2730,
+    dt=0.0000508751,
+    mean_return=690.78,
+    volatility=252.9,
+    mean_volume=96961,
+    volume_std=36961.30,
+    interval_millis=5 * 60 * 1000  # 5 minutes
+):
+    scale_factor = 10000.0
+    mu = mean_return / scale_factor
+    sigma = volatility / scale_factor
+
+    prices = []
+    last_close = initial_price
+    current_time = pd.Timestamp.now().value // 10**6 - (lookback * interval_millis)
+    for i in range(lookback):
+        Z = box_muller_transform()
+        drift = (mu - (sigma ** 2) / 2) * dt
+        diffusion = sigma * np.sqrt(dt) * Z
+        next_close = last_close * np.exp(drift + diffusion)
+        open_ = last_close
+        high = max(open_, next_close) + abs(next_close - open_) * np.random.rand() * 0.5
+        low = min(open_, next_close) - abs(next_close - open_) * np.random.rand() * 0.5
+        volumeZ = box_muller_transform()
+        volume = max(0, mean_volume + (volumeZ * volume_std))
+
+        prices.append({
+            'timestamp': pd.to_datetime(current_time, unit='ms'),
+            'open': round(open_, 2),
+            'high': round(high, 2),
+            'low': round(low, 2),
+            'close': round(next_close, 2),
+            'volume': int(round(volume))
+        })
+
+        last_close = next_close
+        current_time += interval_millis
+
+    return pd.DataFrame(prices)
+
+
+@njit
+def alma_numba(arr, window, sigma, offset):
+    n = len(arr)
+    alma = np.full(n, np.nan, dtype=arr.dtype)
+    m = offset * (window - 1)
+    s = window / sigma
+    exp_denom = 2 * (s ** 2)
+    # Ensure weights are the same dtype as arr
+    weights = np.array([np.exp(-((i - m) ** 2) / exp_denom) for i in range(window)], dtype=arr.dtype)
+    weights /= weights.sum()
+    for i in range(window - 1, n):
+        window_slice = arr[i - window + 1:i + 1]
+        if np.isnan(window_slice).any():
+            continue
+        alma[i] = np.dot(window_slice, weights)
+    return alma
+
+
+def alma_portable(series, window=14, sigma=4, offset=0.618):
+    index = series.index if hasattr(series, 'index') else None
+    arr = np.asarray(series)
+    alma = alma_numba(arr, window, sigma, offset)
+    return pd.Series(alma, index=index)
+
+def true_range_portable(high, low, close):
+    """Portable True Range calculation (matches ThinkScript logic, robust to NaN)."""
+    prev_close = close.shift(1)
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return tr
+
+def atr_portable(df, length=14):
+    """Portable ATR calculation (matches ThinkScript logic, robust to NaN)."""
+    tr = true_range_portable(df['high'], df['low'], df['close'])
+    return tr.rolling(window=length, min_periods=length).mean()
+
+def wma_portable(series, length):
+    """Weighted Moving Average, robust to NaN."""
+    weights = np.arange(1, length + 1)
+    def wma_func(x):
+        if np.isnan(x).any():
+            return np.nan
+        return np.dot(x, weights) / weights.sum()
+    return series.rolling(length, min_periods=length).apply(wma_func, raw=True)
+
+def calculate_slope(series, length):
+    """ThinkScript-style slope: 6 * (WMA - SMA) / (length - 1), robust to NaN."""
+    wma = wma_portable(series, length)
+    sma = series.rolling(length, min_periods=length).mean()
+    slope = 6 * (wma - sma) / (length - 1)
+    return slope
+
+def calculate_standard_indicators(df: pd.DataFrame, settings: dict) -> pd.DataFrame:
+    """Calculates standard indicators with ThinkScript-compatible logic (portable, robust to NaN)."""
+    df['range_val'] = df['high'] - df['low']
+    df['alma'] = alma_portable(df['close'], window=settings['alma_len'], sigma=settings['alma_sigma'], offset=settings['alma_offset'])
+    df['tr'] = true_range_portable(df['high'], df['low'], df['close'])
+    df['atr'] = df['tr'].rolling(window=settings['atr_len'], min_periods=settings['atr_len']).mean() * settings['atr_multiple']
+    df['atr_ma'] = df['atr'].rolling(window=settings['atr_ma_len'], min_periods=settings['atr_ma_len']).mean()
+    df['regression_slope'] = calculate_slope(df['close'], settings['rslope_len'])
+    df['normalized_atr'] = df['atr'] / df['close']
+    df['log_return'] = np.log(df['close'] / df['close'].shift(1))
+    df['log_volume'] = np.log1p(df['volume'])
+    df['volume_level'] = pd.qcut(df['volume'], 3, labels=['low', 'normal', 'high'], duplicates='drop').fillna('normal')
+    # Only drop rows where all required indicators are present and not NaN
+    required_cols = ['alma', 'atr_ma', 'regression_slope', 'normalized_atr', 'log_return', 'log_volume']
+    df = df.dropna(subset=required_cols, how='all').reset_index()
+    return df
+
+def custom_dbscan_ts(df, params):
+    """
+    Portable DBSCAN for time series, supporting 1D (price) and 2D (price+time) distance.
+    df: DataFrame with at least a 'close' column (and index for time).
+    params: dict with keys:
+        - eps1D: float
+        - eps2D: float
+        - timeScale: float
+        - minPts: int
+        - lookback: int
+        - DistanceType: "One-dimensional" or "Two-dimensional"
+    Returns: np.ndarray of bool (True if breakout/consolidation detected)
+    """
+    closes = df['close'] if 'close' in df else df['Close']
+    n = len(closes)
+    is_breakout = np.zeros(n, dtype=bool)
+    for k in range(params['lookback'] - 1, n):
+        window = closes.iloc[k - params['lookback'] + 1:k + 1]
+        last_point = window.iloc[-1]
+        if params['DistanceType'] == "One-dimensional":
+            neighbors = np.sum(np.abs(window.iloc[:-1] - last_point) <= params['eps1D'])
+        else:
+            # 2D: price and time
+            neighbors = np.sum([
+                np.sqrt((i / params['timeScale']) ** 2 + (window.iloc[i] - last_point) ** 2) <= params['eps2D']
+                for i in range(len(window) - 1)
+            ])
+        if neighbors >= params['minPts']:
+            is_breakout[k] = True
+    return pd.Series(is_breakout, index=closes.index)
+
+def pre_calculate_market_conditions(df: pd.DataFrame, settings: dict) -> pd.DataFrame:
+    """Pre-calculates market conditions (fully vectorized except DBSCAN)."""
+    alma_diff = df['alma'].diff().astype(float)
+    df['mc_trendingUp'] = alma_diff > 0
+    df['mc_trendingDown'] = alma_diff < 0
+    df['mc_volatile'] = df['atr'] > df['atr_ma']
+    dbscan_params = {
+    'eps1D': settings['eps1D'],
+    'eps2D': settings['eps2D'],
+    'timeScale': settings['time_scale'],
+    'minPts': settings['min_pts'],
+    'lookback': settings['lookback_dbscan'],
+    'DistanceType': 'Two-dimensional'  # or 'One-dimensional' if you want 1D
+}
+    df['mc_consolidating'] = custom_dbscan_ts(df, dbscan_params)
+    return df
+
+def determine_candle_pattern_vectorized(df_candles, body_size_threshold, wick_size_threshold):
+    """Matches ThinkScript candle pattern logic using vectorized operations."""
+    # Ensure volume_level is accessible globally or passed
+    # For now, assuming THINKSCRIPT_PARAMS is globally accessible as in the original code
+    
+    range_val = df_candles['high'] - df_candles['low']
+    body_val = np.abs(df_candles['close'] - df_candles['open'])
+    upper_wick_val = df_candles['high'] - np.maximum(df_candles['open'], df_candles['close'])
+    lower_wick_val = np.minimum(df_candles['open'], df_candles['close']) - df_candles['low']
+    
+    # Handle division by zero for safe calculations
+    safe_range_val = np.maximum(range_val, 1e-10)
+    safe_body_val = np.maximum(body_val, 1e-10)
+
+    # Volume thresholds based on volume_level column
+    # This requires df_candles to have 'volume_level' populated
+    volume_thresholds = np.select(
+        [df_candles['volume_level'] == 'high', df_candles['volume_level'] == 'normal', df_candles['volume_level'] == 'low'],
+        [THINKSCRIPT_PARAMS['high_volume_threshold'], THINKSCRIPT_PARAMS['normal_volume_threshold'], THINKSCRIPT_PARAMS['low_volume_threshold']],
+        default=THINKSCRIPT_PARAMS['normal_volume_threshold'] # Default if volume_level is not one of these
+    )
+
+    body_condition_met = body_val <= body_size_threshold * safe_range_val
+    doji_wick_balance_met = np.abs(upper_wick_val - lower_wick_val) <= 0.2 * safe_range_val
+    
+    # Initialize pattern series with 'None'
+    patterns = pd.Series('None', index=df_candles.index, dtype=object)
+
+    # Hammer conditions
+    hammer_cond = (
+        body_condition_met & 
+        (lower_wick_val > 1.5 * body_val) & 
+        (upper_wick_val < 0.1 * range_val) &
+        (df_candles['close'] > df_candles['open']) & 
+        (df_candles['volume'] > volume_thresholds)
+    )
+    patterns[hammer_cond] = 'Hammer'
+
+    # Doji conditions
+    doji_cond = (
+        (body_val < 0.1 * range_val) & 
+        doji_wick_balance_met
+    )
+    patterns[doji_cond] = 'Doji'
+
+    # ShootingStar conditions
+    shooting_star_cond = (
+        body_condition_met & 
+        (upper_wick_val > 1.5 * body_val) & 
+        (lower_wick_val < 0.1 * range_val) &
+        (df_candles['close'] < df_candles['open']) & 
+        (df_candles['volume'] > volume_thresholds)
+    )
+    patterns[shooting_star_cond] = 'ShootingStar'
+
+    # Custom conditions (apply only if no other pattern has been assigned)
+    custom_cond = (
+        body_condition_met & 
+        ((lower_wick_val > wick_size_threshold * safe_body_val) | 
+         (upper_wick_val > wick_size_threshold * safe_body_val))
+    )
+    # Only assign 'Custom' if the current pattern is still 'None'
+    patterns[custom_cond & (patterns == 'None')] = 'Custom'
+
+    return patterns
+
+def is_near_support_alma_vectorized(candle_low_series, alma_value_series):
+    """Checks if candle low is near ALMA support using vectorized operations."""
+    threshold_pct = THINKSCRIPT_PARAMS['alma_proximity_threshold']
+    # Filter out invalid alma_values (NaN or <= 0) to avoid division by zero or incorrect calculations
+    valid_alma = (alma_value_series.notna()) & (alma_value_series > 0)
+    
+    # Calculate relative difference only for valid alma values
+    relative_diff = (alma_value_series - candle_low_series) / alma_value_series
+    
+    # Apply conditions
+    condition = (-threshold_pct <= relative_diff) & (relative_diff <= threshold_pct * 2)
+    
+    # Combine with valid_alma mask
+    return condition & valid_alma
+
+def is_near_resistance_alma_vectorized(candle_high_series, alma_value_series):
+    """Checks if candle high is near ALMA resistance using vectorized operations."""
+    threshold_pct = THINKSCRIPT_PARAMS['alma_proximity_threshold']
+    # Filter out invalid alma_values (NaN or <= 0)
+    valid_alma = (alma_value_series.notna()) & (alma_value_series > 0)
+    
+    # Calculate relative difference only for valid alma values
+    relative_diff = (candle_high_series - alma_value_series) / alma_value_series
+    
+    # Apply conditions
+    condition = (-threshold_pct * 2 <= relative_diff) & (relative_diff <= threshold_pct)
+    
+    # Combine with valid_alma mask
+    return condition & valid_alma
+
+def calculate_alma_trend(df: pd.DataFrame) -> pd.Series:
+    """Calculates ALMA trend."""
+    # Ensure the diff result is float before comparison
+    alma_diff = df['alma'].diff(periods=5).astype(float)
+    trend = pd.Series(0, index=df.index)
+    trend[alma_diff > 0] = 1
+    trend[alma_diff < 0] = -1
+    return trend
+
+def create_state(df: pd.DataFrame, index_loc: int, features: list) -> tuple:
+    """Creates a state tuple for RL."""
+    if index_loc >= len(df) or index_loc < 0:
+        return tuple([None] * len(features))
+    row_data = df.iloc[index_loc]
+    state_values = []
+    for feature in features:
+        val = row_data.get(feature)
+        if pd.isna(val):
+            state_values.append("0" if feature in ['regression_slope', 'normalized_atr'] else "NaN")
+        elif isinstance(val, (int, float, bool)):
+            state_values.append(str(val))
+        else:
+            state_values.append(val)
+    return tuple(state_values)
+
+def run_simulation_for_settings(candles, params):
+    """Runs simulation for a given parameter set."""
+    try:
+        take_profit_pct = params["take_profit_pct"]
+        stop_loss_pct = params["stop_loss_pct"]
+        body_size_threshold = params["body_size_threshold"]
+        wick_size_threshold = params["wick_size_threshold"]
+        # volume_level = params["volume_level"] # This parameter is used for pattern determination (removed: unused variable)
+        entry_trigger = params["entry_trigger"]
+        wick_position = params["wick_position"]
+        position_type = params["position_type"]
+        num_trades = params.get("num_trades", 50)
+        simulated_win_rate = params.get("simulated_win_rate", 0.5)
+
+        if candles.empty or len(candles) < num_trades:
+            return {"success": False, "message": "Not enough applicable candles for simulation", **params}
+
+        applicable_candles = candles.copy()
+        # Drop NaNs upfront for critical columns to avoid issues in vectorized operations
+        if applicable_candles[['high', 'low', 'alma', 'open', 'close', 'volume']].isna().any().any():
+            logger.warning("NaN values detected in critical columns, dropping NaN rows")
+            applicable_candles = applicable_candles.dropna(subset=['high', 'low', 'alma', 'open', 'close', 'volume'])
+
+        # Apply vectorized wick position filters
+        if wick_position == 'nearSupport':
+            applicable_candles = applicable_candles[is_near_support_alma_vectorized(applicable_candles['low'], applicable_candles['alma'])]
+        elif wick_position == 'nearResistance':
+            applicable_candles = applicable_candles[is_near_resistance_alma_vectorized(applicable_candles['high'], applicable_candles['alma'])]
+
+        # Apply vectorized entry trigger filters
+        if entry_trigger == 'closeAboveLowerWick':
+            applicable_candles = applicable_candles[applicable_candles['close'] > (applicable_candles['low'] + 0.5 * (applicable_candles['high'] - applicable_candles['low']))]
+        elif entry_trigger == 'closeBelowUpperWick':
+            applicable_candles = applicable_candles[applicable_candles['close'] < (applicable_candles['high'] - 0.5 * (applicable_candles['high'] - applicable_candles['low']))]
+        elif entry_trigger == 'breakWickHighLow':
+            # This requires looking at previous candle's high, ensure it's shifted correctly
+            applicable_candles = applicable_candles[applicable_candles['close'] > applicable_candles['high'].shift(1)]
+        elif entry_trigger == 'nextCandleOpen':
+            # This requires looking at next candle's open, ensure it's shifted correctly
+            applicable_candles = applicable_candles[applicable_candles['open'].shift(-1) > applicable_candles['close']]
+        elif entry_trigger == 'customPercentWick':
+            applicable_candles = applicable_candles[applicable_candles['close'] > (applicable_candles['low'] + 0.3 * (applicable_candles['high'] - applicable_candles['low']))]
+
+        # Determine candle pattern using the vectorized function
+        # Ensure 'volume_level' is already present in applicable_candles DataFrame
+        if 'volume_level' not in applicable_candles.columns:
+             try:
+                 applicable_candles['volume_level'] = pd.qcut(applicable_candles['volume'], 3, labels=['low', 'normal', 'high'], duplicates='drop').fillna('normal')
+                 # If not all labels are present, fallback to cut
+                 if set(applicable_candles['volume_level'].unique()) != {'low', 'normal', 'high'}:
+                     raise ValueError("Not all volume levels present")
+             except Exception:
+                 applicable_candles['volume_level'] = pd.cut(applicable_candles['volume'], bins=3, labels=['low', 'normal', 'high'], include_lowest=True).fillna('normal')
+
+        applicable_candles['pattern'] = determine_candle_pattern_vectorized(applicable_candles, body_size_threshold, wick_size_threshold)
+        applicable_candles = applicable_candles[applicable_candles['pattern'] != 'None']
+
+        if applicable_candles.empty or len(applicable_candles) < num_trades:
+            return {"success": False, "message": "Not enough applicable candles after filtering", **params}
+
+        trade_returns, wins = [], 0
+        equity, peak_equity, max_drawdown_val = 10000, 10000, 0
+        win_amount = 100 * (take_profit_pct / 100)  # Adjusted for ES futures
+        loss_amount = 100 * (stop_loss_pct / 100)
+        
+        # Ensure num_trades does not exceed available candles if replace=False
+        can_replace = len(applicable_candles) < num_trades
+        # Sample directly from the DataFrame
+        sampled_candles = applicable_candles.sample(n=num_trades, replace=can_replace, random_state=params.get('random_seed', 42))
+
+        last_pattern = "N/A"
+        for _, candle in sampled_candles.iterrows():
+            last_pattern = candle['pattern']
+            is_win = random.random() < simulated_win_rate
+            trade_profit = (
+                win_amount if is_win and position_type == 'long' else
+                -win_amount if is_win and position_type == 'short' else
+                -loss_amount if not is_win and position_type == 'long' else
+                loss_amount
+            )
+            if is_win:
+                wins += 1
+            trade_returns.append(trade_profit)
+            equity += trade_profit
+            peak_equity = max(peak_equity, equity)
+            drawdown = (peak_equity - equity) / peak_equity if peak_equity > 0 else 0
+            max_drawdown_val = max(max_drawdown_val, drawdown)
+
+        result = params.copy()
+        result.update({
+            "success": True,
+            "message": "Simulation successful",
+            "total_profit": sum(trade_returns),
+            "win_rate": (wins / num_trades * 100) if num_trades > 0 else 0,
+            "total_trades": num_trades,
+            "max_drawdown": max_drawdown_val * 100,
+            "returns": json.dumps(trade_returns),
+            "wins": wins,
+            "pattern": last_pattern
+        })
+        return result
+    except Exception as e:
+        logger.exception("Error in run_simulation_for_settings")  # Logs full traceback
+        return {"success": False, "message": f"Simulation failed: {e}", **params}
+
+def compute_metrics(results_list):
+    try:
+        for result in results_list:
+            if not isinstance(result, dict) or not result.get("success"):
+                continue
+            try:
+                returns_cleaned = json.loads(result.get("returns", "[]"))
+            except (json.JSONDecodeError, TypeError):
+                returns_cleaned = []
+
+            if not returns_cleaned:
+                result.update({"sharpeRatio": 0, "profitFactor": 0, "score": 0})
+                continue
+
+            mean_return = np.mean(returns_cleaned)
+            std_dev = np.std(returns_cleaned)
+            # Adjusted for 5-minute bars (~78/day, 252 trading days/year)
+            result["sharpeRatio"] = (mean_return / std_dev) * np.sqrt(252 * 78) if std_dev > 0 else 0 
+            gross_profit = sum(r for r in returns_cleaned if r > 0)
+            gross_loss = abs(sum(r for r in returns_cleaned if r < 0))
+            result["profitFactor"] = (gross_profit / gross_loss) if gross_loss > 0 else 100
+
+            norm_win_rate = result.get("win_rate", 0) / 100.0
+            norm_drawdown = result.get("max_drawdown", 100) / 100.0
+            norm_profit = np.log1p(max(result.get("total_profit", 0), 0)) / np.log1p(10000)
+            norm_sharpe = (result["sharpeRatio"] + 3) / 6
+
+            norm_win_rate = max(0.0, min(1.0, norm_win_rate))
+            norm_profit = max(0.0, min(1.0, norm_profit))
+            norm_sharpe = max(0.0, min(1.0, norm_sharpe))
+            norm_drawdown = max(0.0, min(1.0, norm_drawdown))
+
+            # Scoring formula explanation:
+            # - Each metric is normalized to [0, 1] range.
+            # - Weights: 40% low drawdown (1 - norm_drawdown), 30% profit, 20% Sharpe ratio, 10% win rate.
+            # - Rationale: Lower drawdown is prioritized for robustness; profit and Sharpe ratio reflect risk-adjusted returns; win rate is a minor factor.
+            # - Expected value range: score ∈ [0, 100], higher is better.
+            result["score"] = (0.4 * (1 - norm_drawdown) + 0.3 * norm_profit + 0.2 * norm_sharpe + 0.1 * norm_win_rate) * 100
+            if np.isnan(result["score"]):
+                result["score"] = 0
+        return results_list
+    except Exception as e:
+        logger.error(f"Error in compute_metrics: {e}")
+        return results_list
+
+def _run_single_simulation_combo(args): # Modified to accept a single tuple argument
+    """
+    Helper function to run a single simulation combination for multiprocessing.
+    This function must be top-level to be picklable by multiprocessing.
+    """
+    combo, params_input, data_source = args # Unpack the single tuple argument
+    symbol, market_condition, rr_setting, entry_trigger, wick_position, volume_level, position_type, body_thresh, wick_thresh = combo
+    df = data_source.get(symbol) # data_source is a dict like {symbol: df}
+    
+    if df is None or df.empty:
+        logger.warning(f"No data for {symbol}. Skipping.")
+        return None # Return None for skipped combinations
+
+    market_condition_col = f'mc_{market_condition}'
+    if market_condition_col not in df.columns:
+        logger.warning(f"Market condition column '{market_condition_col}' not found for {symbol}. Skipping.")
+        return None
+
+    applicable_candles = df[df[market_condition_col]].copy()
+    if applicable_candles.empty:
+        logger.warning(f"No applicable candles for {symbol} under {market_condition}. Skipping.")
+        return None
+
+    rule_code = (f"ET:{entry_trigger}|WP:{wick_position}|MC:{market_condition}|VL:{volume_level}|"
+                 f"TP:{rr_setting['take_profit_pct']}|SL:{rr_setting['stop_loss_pct']}|"
+                 f"WC:5|TF:5min|NT:{params_input['num_trades']}|"
+                 f"BT:{body_thresh}|WT:{wick_thresh}|PT:{position_type}")
+    
+    sim_params = {
+        "symbol": symbol,
+        "timeframe": "5min",
+        "rule_code": rule_code,
+        "market_condition": market_condition,
+        "entry_trigger": entry_trigger,
+        "wick_position": wick_position,
+        "volume_level": volume_level,
+        "position_type": position_type,
+        "body_size_threshold": body_thresh,
+        "wick_size_threshold": wick_thresh,
+        **rr_setting,
+        **params_input
+    }
+    
+    result = run_simulation_for_settings(applicable_candles, sim_params)
+    return result if result.get("success") else None
+
+def run_simulation(params_input, data_source):
+    """Main simulation function for ES5 with all combinations, using 5-minute timeframe."""
+    try:
+        settings = params_input['indicator_settings']
+        market_conditions_list = ["trendingUp", "trendingDown", "volatile", "consolidating"]
+        risk_reward_settings_list = [
+            {"take_profit_pct": 0.5, "stop_loss_pct": 0.25, "ratio": "2:1", "range": "High"},
+            {"take_profit_pct": 0.4, "stop_loss_pct": 0.2, "ratio": "2:1", "range": "Mid"},
+            {"take_profit_pct": 0.3, "stop_loss_pct": 0.15, "ratio": "2:1", "range": "Low"},
+            {"take_profit_pct": 0.75, "stop_loss_pct": 0.25, "ratio": "3:1", "range": "High"},
+            {"take_profit_pct": 0.6, "stop_loss_pct": 0.2, "ratio": "3:1", "range": "Mid"},
+            {"take_profit_pct": 0.45, "stop_loss_pct": 0.15, "ratio": "3:1", "range": "Low"},
+            {"take_profit_pct": 1.0, "stop_loss_pct": 0.25, "ratio": "4:1", "range": "High"},
+            {"take_profit_pct": 0.8, "stop_loss_pct": 0.2, "ratio": "4:1", "range": "Mid"},
+            {"take_profit_pct": 0.6, "stop_loss_pct": 0.15, "ratio": "4:1", "range": "Low"},
+            {"take_profit_pct": 1.25, "stop_loss_pct": 0.25, "ratio": "5:1", "range": "High"},
+            {"take_profit_pct": 1.0, "stop_loss_pct": 0.2, "ratio": "5:1", "range": "Mid"},
+            {"take_profit_pct": 0.75, "stop_loss_pct": 0.15, "ratio": "5:1", "range": "Low"}
+        ]
+        entry_triggers_list = ["closeAboveLowerWick", "closeBelowUpperWick", "breakWickHighLow", "nextCandleOpen", "customPercentWick"]
+        wick_positions_list = ["nearSupport", "nearResistance", "any"]
+        volume_levels_list = ["high", "normal", "low"]
+        position_types_list = ["long", "short"]
+        body_size_thresholds_list = [ 0.3, 0.5, 0.7]  # Adjusted for 5-minute ES candles
+        wick_size_thresholds_list = [ 0.3, 0.5, 0.7, 0.8]  # Adjusted for 5-minute ES candles
+
+        param_grid = list(product(['ES5'], market_conditions_list, risk_reward_settings_list,
+                                  entry_triggers_list, wick_positions_list, volume_levels_list,
+                                  position_types_list, body_size_thresholds_list, wick_size_thresholds_list))
+        logger.info(f"Starting simulation with {len(param_grid)} combinations for ES5 on 5-minute timeframe")
+
+        all_results = []
+        # tested_market_conditions is not directly updated in parallel processes, collect from results later
+
+        # Prepare arguments for map: each task is a single tuple (combo, params_input, data_source)
+        tasks = [(combo, params_input, data_source) for combo in param_grid]
+
+        # Use multiprocessing Pool to run simulations in parallel
+        num_cores = 7  # Limit to 7 cores regardless of system total
+        logger.info(f"Using {num_cores} CPU cores for parallel simulation.")
+        with Pool(processes=num_cores) as pool:
+            # Use map instead of starmap, as _run_single_simulation_combo now expects a single tuple
+            results_iterator = pool.map(_run_single_simulation_combo, tasks)
+            cpu_regulator = CPURegulator(max_cpu=35)
+            for i, result in enumerate(results_iterator):
+                if result is not None:
+                    all_results.append(result)
+                if i % 10 == 0:  # Check every 10 iterations to avoid overhead
+                    cpu_regulator.throttle_if_needed()
+
+        results_filename = f"{CONFIG['results_dir']}/ES5_Simulation_Results_5min.csv"
+        logger.info(f"Saving simulation results: {len(all_results)} results to {results_filename}")
+        # Filter out any None results from skipped combinations
+        df_full_results = pd.DataFrame([res for res in all_results if res is not None]) 
+        logger.info("Saving simulation results")
+        # Filter out any None results from skipped combinations
+        successful_results = [res for res in all_results if res is not None and res.get("success")]
+        if successful_results:
+            compute_metrics(successful_results) # compute_metrics expects a list of dicts
+            df_full_results = pd.DataFrame(successful_results) # Only successful results
+            os.makedirs(CONFIG['results_dir'], exist_ok=True)
+            df_full_results.to_csv(f"{CONFIG['results_dir']}/ES5_Simulation_Results_5min.csv", index=False)
+            logger.info("Simulation results saved to results/ES5_Simulation_Results_5min.csv")
+            logger.info(f"Rule Code Explanation: The Rule Code encodes the inputs for each setup in selfLearningTable. "
+                        f"Format: ET:[entryTrigger]|WP:[wickPosition]|MC:[marketCondition]|VL:[volumeLevel]|"
+                        f"TP:[takeProfitPercent]|SL:[stopLossPercent]|WC:[wickConfidence]|TF:[timeframe]|"
+                        f"NT:[numTrades]|BT:[bodySizeThreshold]|WT:[wickSizeThreshold]|PT:[positionType]. "
+                        f"Example: ET:closeAboveLowerWick|WP:nearSupport|MC:ranging|VL:high|TP:0.5|SL:0.25|WC:5|TF:5min|NT:1000|BT:0.3|WT:0.3|PT:long. "
+                        f"Use this code to replicate the setup by setting the corresponding inputs.")
+        else:
+            logger.warning("No successful simulations generated")
+            df_full_results = pd.DataFrame()
+        
+        # Collect tested market conditions from the final DataFrame
+        if not df_full_results.empty:
+            tested_market_conditions = df_full_results['market_condition'].unique()
+            logger.info(f"Market conditions tested: {tested_market_conditions}")
+        else:
+            logger.info("No market conditions tested (no successful simulations).")
+        
+        return df_full_results
+        return df_full_results
+    except Exception as e:
+        logger.error(f"Error in run_simulation: {e}")
+        return pd.DataFrame()
+
+def backtest_strategy(candles_df: pd.DataFrame, row_params: dict, transaction_cost: float = 0.001, apply_transaction_cost: bool = True) -> dict:
+    if candles_df.empty or len(candles_df) < 2:
+        return {'total_trades': 0, 'win_rate': 0, 'total_profit': 0, 'trades': '[]', 'max_drawdown': 0}
+
+    trades = []
+    position = 0
+    entry_price = 0
+    tp_pct = row_params.get('take_profit_pct', 0.5)  # Adjusted default for ES5
+    sl_pct = row_params.get('stop_loss_pct', 0.25)
+    body_size_threshold = row_params.get('body_size_threshold', 0.3)
+    wick_size_threshold = row_params.get('wick_size_threshold', 0.3)
+    # volume_level = row_params.get('volume_level', 'normal')
+    entry_trigger = row_params.get('entry_trigger', 'closeAboveLowerWick')
+    wick_position = row_params.get('wick_position', 'any')
+    position_type = row_params.get('position_type', 'long')
+    
+    current_equity = 10000
+    peak_equity = current_equity
+    max_drawdown_val = 0
+
+    # Ensure volume_level is set for the entire DataFrame for vectorized pattern determination
+    if 'volume_level' not in candles_df.columns:
+        candles_df['volume_level'] = pd.qcut(candles_df['volume'], 3, labels=['low', 'normal', 'high'], duplicates='drop').fillna('normal')
+
+    # Pre-calculate patterns for the entire DataFrame to avoid re-computation in loop
+    candles_df['pre_calculated_pattern'] = determine_candle_pattern_vectorized(candles_df, body_size_threshold, wick_size_threshold)
+    
+    for i in range(len(candles_df) - 1):
+        candle = candles_df.iloc[i]
+        next_candle = candles_df.iloc[i + 1]
+
+        if position == 0:
+            # Use pre-calculated pattern
+            pattern = candle['pre_calculated_pattern']
+            if pattern != 'None':
+                # Use vectorized functions for near support/resistance
+                # Note: Calling vectorized functions with single-element series for consistency,
+                # though direct comparison would be slightly faster here.
+                wick_position_met = (
+                    wick_position == 'any' or
+                    (wick_position == 'nearSupport' and is_near_support_alma_vectorized(pd.Series([candle['low']]), pd.Series([candle['alma']])).iloc[0]) or
+                    (wick_position == 'nearResistance' and is_near_resistance_alma_vectorized(pd.Series([candle['high']]), pd.Series([candle['alma']])).iloc[0])
+                )
+                
+                entry_trigger_met = False
+                if entry_trigger == 'closeAboveLowerWick':
+                    entry_trigger_met = candle['close'] > (candle['low'] + 0.5 * (candle['high'] - candle['low']))
+                elif entry_trigger == 'closeBelowUpperWick':
+                    entry_trigger_met = candle['close'] < (candle['high'] - 0.5 * (candle['high'] - candle['low']))
+                elif entry_trigger == 'breakWickHighLow':
+                    entry_trigger_met = i > 0 and candle['close'] > candles_df.iloc[i-1]['high']
+                elif entry_trigger == 'nextCandleOpen':
+                    entry_trigger_met = next_candle['open'] > candle['close']
+                elif entry_trigger == 'customPercentWick':
+                    entry_trigger_met = candle['close'] > (candle['low'] + 0.3 * (candle['high'] - candle['low']))
+
+                if wick_position_met and entry_trigger_met:
+                    entry_price = candle['close']
+                    position = 1 if position_type == 'long' else -1
+                    if apply_transaction_cost:
+                        trades.append({'type': 'cost', 'value': -(entry_price * transaction_cost)})
+
+        elif position != 0:
+            profit = 0
+            if position == 1:
+                if next_candle['low'] <= entry_price * (1 - sl_pct / 100):
+                    profit = (entry_price * (1 - sl_pct / 100) - entry_price)
+                    if apply_transaction_cost:
+                        profit -= (entry_price * transaction_cost)
+                    position = 0
+                elif next_candle['high'] >= entry_price * (1 + tp_pct / 100):
+                    profit = (entry_price * (1 + tp_pct / 100) - entry_price)
+                    if apply_transaction_cost:
+                        profit -= (entry_price * transaction_cost)
+                    position = 0
+            elif position == -1:
+                if next_candle['high'] >= entry_price * (1 + sl_pct / 100):
+                    profit = (entry_price - entry_price * (1 + sl_pct / 100))
+                    if apply_transaction_cost:
+                        profit -= (entry_price * transaction_cost)
+                    position = 0
+                elif next_candle['low'] <= entry_price * (1 - tp_pct / 100):
+                    profit = (entry_price - entry_price * (1 - tp_pct / 100))
+                    if apply_transaction_cost:
+                        profit -= (entry_price * transaction_cost)
+                    position = 0
+            
+            if profit != 0:
+                trades.append({'type': 'profit', 'value': profit})
+                current_equity += profit
+                peak_equity = max(peak_equity, current_equity)
+                drawdown = (peak_equity - current_equity) / peak_equity if peak_equity > 0 else 0
+                max_drawdown_val = max(max_drawdown_val, drawdown)
+
+    actual_trades = [t['value'] for t in trades if t['type'] == 'profit']
+    total_profit = sum(t['value'] for t in trades if t['type'] == 'profit')
+    num_wins = sum(1 for t in actual_trades if t > 0)
+    num_actual_trades = len(actual_trades)
+    win_rate = (num_wins / num_actual_trades * 100) if num_actual_trades > 0 else 0
+
+    return {
+        'total_trades': num_actual_trades,
+        'win_rate': win_rate,
+        'total_profit': total_profit,
+        'trades': json.dumps(actual_trades),
+        'max_drawdown': max_drawdown_val * 100
+    }
+
+def run_oos_validation(df_full_results, all_prepared_data, oos_config, main_params):
+    """Runs Out-of-Sample validation on top N strategies."""
+    # The try-except block now correctly wraps the entire function logic
+    # to satisfy Pylance warning and ensure comprehensive error handling.
+    try: 
+        logger.info("Starting Out-of-Sample (OOS) Validation for ES5")
+        if df_full_results.empty:
+            logger.warning("No simulation results for OOS validation")
+            return pd.DataFrame()
+
+        top_n = main_params.get("top_n_to_validate", 50)
+        validation_results = []
+        df_top_setups = df_full_results.sort_values(by="score", ascending=False).head(top_n)
+
+        for _, row in df_top_setups.iterrows():
+            symbol = row["symbol"]
+            full_df_no_anomalies = all_prepared_data.get(symbol)
+            if full_df_no_anomalies is None or full_df_no_anomalies.empty:
+                logger.warning(f"No data for {symbol} in OOS validation")
+                continue
+
+            full_df_no_anomalies = full_df_no_anomalies.sort_values(by='timestamp').reset_index()
+            split_point_index = int(len(full_df_no_anomalies) * oos_config['in_sample_pct'])
+            oos_df = full_df_no_anomalies.iloc[split_point_index:].copy()
+            
+            if oos_df.empty:
+                logger.warning(f"No OOS data for {symbol}")
+                continue
+
+            market_condition_col = f'mc_{row["market_condition"]}' # Corrected: Removed extra quote
+            if market_condition_col not in oos_df.columns:
+                logger.warning(f"OOS market condition column '{market_condition_col}' not found for {symbol}. Skipping.")
+                continue
+            
+            oos_candles_for_rule = oos_df[oos_df[market_condition_col]].copy()
+            
+            # Ensure 'volume_level' is present for pattern determination
+            if 'volume_level' not in oos_candles_for_rule.columns:
+                oos_candles_for_rule['volume_level'] = pd.qcut(oos_candles_for_rule['volume'], 3, labels=['low', 'normal', 'high'], duplicates='drop').fillna('normal')
+
+            if 'body_size_threshold' in row and 'wick_size_threshold' in row and 'volume_level' in row:
+                # Use vectorized pattern determination
+                oos_candles_for_rule['actual_pattern'] = determine_candle_pattern_vectorized(
+                    oos_candles_for_rule, row['body_size_threshold'], row['wick_size_threshold']
+                )
+                if 'pattern' in row and row['pattern'] != 'N/A':
+                    oos_candles_for_rule = oos_candles_for_rule[oos_candles_for_rule['actual_pattern'] == row['pattern']]
+            
+            if oos_candles_for_rule.empty:
+                logger.warning(f"No OOS candles matching market condition and pattern for {symbol}. Skipping backtest.")
+                continue
+
+            bt_params = row.to_dict()
+            bt_result = backtest_strategy(oos_candles_for_rule, bt_params)
+            
+            combined_result = row.to_dict()
+            combined_result.update({
+                "oos_bt_total_trades": bt_result.get("total_trades"),
+                "oos_bt_win_rate": bt_result.get("win_rate"),
+                "oos_bt_total_profit": bt_result.get("total_profit"),
+                "oos_bt_trades_json": bt_result.get("trades"),
+                "oos_bt_max_drawdown": bt_result.get("max_drawdown")
+            })
+            validation_results.append(combined_result)
+
+        df_validated = pd.DataFrame(validation_results)
+        if not df_validated.empty:
+            os.makedirs(CONFIG['results_dir'], exist_ok=True)
+            df_validated.to_csv(f"{CONFIG['results_dir']}/ES5_FinalValidatedSetups.csv", index=False)
+            logger.info("Top validated setups saved to results/ES5_FinalValidatedSetups.csv")
+        return df_validated
+    except Exception as e:
+        logger.error(f"Error in run_oos_validation: {e}")
+        return pd.DataFrame()
+
+def run_monte_carlo_analysis(df_validated_setups, mc_config):
+    """Runs Monte Carlo simulation on OOS backtest results."""
+    try:
+        logger.info("Starting Monte Carlo Simulation Analysis for ES5")
+        if df_validated_setups.empty:
+            logger.warning("No validated setups for Monte Carlo analysis")
+            return pd.DataFrame()
+
+        mc_results = []
+        for _, row in df_validated_setups.iterrows():
+            try:
+                trade_returns = json.loads(row.get("oos_bt_trades_json", "[]"))
+            except (json.JSONDecodeError, TypeError):
+                logger.warning(f"Could not decode trade returns for MC simulation for rule {row.get('rule_code', 'N/A')}")
+                continue
+
+            if not trade_returns or len(trade_returns) < 5:
+                logger.warning(f"Insufficient trades for MC simulation for rule {row.get('rule_code', 'N/A')}")
+                continue
+
+            num_sims = mc_config.get("simulations", 1000)
+            trades_per_sim = len(trade_returns) * 2
+            S0 = row.get('start_price', 100)  # Or use a real starting price
+            mu = np.mean(trade_returns)
+            sigma = np.std(trade_returns)
+            T = trades_per_sim / 252  # e.g., if 252 trading days/year
+            dt = 1 / 252
+
+
+            final_equities = []
+            for _ in range(num_sims):
+                prices_df = generate_gbm_price_data(
+                    initial_price=S0,
+                    lookback=trades_per_sim,
+                    dt=float(dt),
+                    mean_return=float(mu),
+                    volatility=float(sigma)
+                )
+                profit = prices_df['close'].iloc[-1] - prices_df['close'].iloc[0]
+                final_equities.append(profit)
+
+            mc_summary = row.to_dict()
+            mc_summary.update({
+                "mc_simulations": num_sims,
+                "mc_avg_final_profit": np.mean(final_equities),
+                "mc_median_final_profit": np.median(final_equities),
+                "mc_5th_percentile_profit": np.percentile(final_equities, 5),
+                "mc_prob_of_profit": (sum(1 for e in final_equities if e > 0) / num_sims) * 100
+            })
+            mc_results.append(mc_summary)
+
+        df_mc_results = pd.DataFrame(mc_results)
+        if not df_mc_results.empty:
+            os.makedirs(CONFIG['results_dir'], exist_ok=True)
+            df_mc_results.to_csv(f"{CONFIG['results_dir']}/ES5_MonteCarloAnalysis.csv", index=False)
+            logger.info("Monte Carlo analysis complete and saved to results/ES5_MonteCarloAnalysis.csv")
+        return df_mc_results
+    except Exception as e:
+        logger.error(f"Error in run_monte_carlo_analysis: {e}")
+        return pd.DataFrame()
+
+def run_advanced_ml_validation(df_validated_setups, all_prepared_data, main_params):
+    """Runs advanced ML validation with LightGBM and CatBoost, incorporating temporal features."""
+    try:
+        logger.info("Starting Advanced ML Validation Layer (LightGBM and CatBoost) for ES5")
+        if df_validated_setups.empty:
+            logger.warning("No validated setups for ML validation")
+            return pd.DataFrame()
+
+        ml_results = []
+        
+        # Define global variables for Optuna objectives to access
+        # These will be populated within the loop for each symbol
+        global X_train_global, X_test_global, y_train_global, y_test_global, scaler_global
+        X_train_global, X_test_global, y_train_global, y_test_global = pd.DataFrame(), pd.DataFrame(), pd.Series(), pd.Series()
+        scaler_global = StandardScaler()
+
+        def objective_lgbm(trial):
+            # X_train_global, y_train_global are populated from the outer scope
+            if X_train_global.empty or y_train_global.empty:
+                return -1.0 # Return a low score if data is not ready
+            params = {
+                'n_estimators': trial.suggest_int('n_estimators', 50, 200),
+                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
+                'max_depth': trial.suggest_int('max_depth', 3, 10),
+                'random_state': main_params.get('random_seed', 42),
+                'n_jobs': -1
+            }
+            model = lgb.LGBMClassifier(**params)
+            # Pylance might report an issue here, but LGBMClassifier is compatible with BaseEstimator
+            cv_score = cross_val_score(model, X_train_global, y_train_global, cv=5, scoring='accuracy').mean() # type: ignore
+            return cv_score
+
+        def objective_catboost(trial):
+            # X_train_global, y_train_global are populated from the outer scope
+            if X_train_global.empty or y_train_global.empty:
+                return -1.0 # Return a low score if data is not ready
+            params = {
+                'iterations': trial.suggest_int('iterations', 50, 200),
+                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
+                'depth': trial.suggest_int('depth', 3, 10),
+                'random_seed': main_params.get('random_seed', 42),
+                'verbose': 0,
+                'early_stopping_rounds': 10
+            }
+            model = cb.CatBoostClassifier(**params)
+            # Pylance might report an issue here, but CatBoostClassifier is compatible with BaseEstimator
+            cv_score = cross_val_score(model, X_train_global, y_train_global, cv=5, scoring='accuracy').mean() # type: ignore
+            return cv_score
+
+        for idx, row in df_validated_setups.iterrows():
+            symbol = row["symbol"]
+            df_symbol = all_prepared_data.get(symbol)
+            if df_symbol is None or df_symbol.empty:
+                logger.warning(f"No data for {symbol} in ML validation. Skipping row {idx}.")
+                continue
+
+            df_symbol_clean = df_symbol.copy()
+            
+            # --- Feature Engineering and Target Creation ---
+            # Calculate lagged returns and alma_diff BEFORE dropping NaNs, then drop NaNs
+            df_symbol_clean['lag1_return'] = df_symbol_clean['log_return'].shift(1)
+            df_symbol_clean['lag2_return'] = df_symbol_clean['log_return'].shift(2)
+            df_symbol_clean['alma_diff'] = df_symbol_clean['alma'].diff()
+            
+            # Create target *before* dropping NaNs to ensure target alignment
+            df_symbol_clean['next_return'] = df_symbol_clean['close'].pct_change().shift(-1)
+            df_symbol_clean['target'] = (df_symbol_clean['next_return'] > 0).astype(int)
+
+            # Define all columns that must be non-NaN for ML model training
+            required_cols_for_ml = [
+                'alma', 'regression_slope', 'atr', 'atr_ma', 'volume',
+                'log_return', 'normalized_atr', 'log_volume',
+                'lag1_return', 'lag2_return', 'alma_diff', 'target' # Include target in dropna
+            ]
+            # Drop NaNs for all required features and target simultaneously
+            df_symbol_clean = df_symbol_clean.dropna(subset=required_cols_for_ml).copy() # Use .copy() to avoid SettingWithCopyWarning
+
+            if df_symbol_clean.empty:
+                logger.warning(f"No clean data for {symbol} after dropping NaNs. Skipping row {idx}.")
+                continue
+
+            features = df_symbol_clean[[
+                'alma', 'regression_slope', 'atr', 'atr_ma', 'volume',
+                'log_return', 'normalized_atr', 'log_volume',
+                'lag1_return', 'lag2_return', 'alma_diff'
+            ]]
+            target = df_symbol_clean['target'] # Target is now guaranteed to be aligned by index
+            # Add this line to clean features:
+            # Add this line to clean features:
+            features = features.replace([np.inf, -np.inf], np.nan).dropna()
+            target = target.loc[features.index]  # Align target with cleaned features
+
+            if len(features) < 50:
+                logger.warning(f"Insufficient data for {symbol} after alignment. Skipping row {idx}.")
+                continue
+
+            # Populate global variables for Optuna objectives and model training
+            X_train_global, X_test_global, y_train_global, y_test_global = train_test_split(
+                features, target, test_size=0.2, shuffle=False
+            )
+            
+            # Scale training data for models
+            scaler_global = StandardScaler() # Re-initialize scaler for each symbol
+            X_train_global_scaled = scaler_global.fit_transform(X_train_global)
+            X_test_global_scaled = scaler_global.transform(X_test_global)
+
+            # Convert scaled arrays back to DataFrame for consistent feature names in Optuna (and future use)
+            X_train_global = pd.DataFrame(X_train_global_scaled, columns=X_train_global.columns, index=X_train_global.index)
+            X_test_global = pd.DataFrame(X_test_global_scaled, columns=X_test_global.columns, index=X_test_global.index)
+
+
+            try:
+                study_lgbm = optuna.create_study(
+                    direction='maximize',
+                    sampler=optuna.samplers.TPESampler(seed=main_params.get('random_seed', 42))
+                )
+                study_lgbm.optimize(objective_lgbm, n_trials=50, show_progress_bar=False)
+                lgbm_model = lgb.LGBMClassifier(**study_lgbm.best_params)
+                lgbm_model.fit(X_train_global, y_train_global) # Use global scaled data
+                # Pylance might report an issue here, but .score() is a valid method on LGBMClassifier
+                lgbm_score = lgbm_model.score(X_test_global, y_test_global) # type: ignore # Use global scaled data
+            except Exception as e:
+                logger.warning(f"LGBM failed for {symbol}: {e}. Setting score to 0.")
+                lgbm_score = 0.0
+
+            try:
+                study_catboost = optuna.create_study(
+                    direction='maximize',
+                    sampler=optuna.samplers.TPESampler(seed=main_params.get('random_seed', 42))
+                )
+                study_catboost.optimize(objective_catboost, n_trials=50, show_progress_bar=False)
+                catboost_model = cb.CatBoostClassifier(**study_catboost.best_params)
+                catboost_model.fit(X_train_global, y_train_global) # Use global scaled data
+                # Pylance might report an issue here, but .score() is a valid method on CatBoostClassifier
+                catboost_score = catboost_model.score(X_test_global, y_test_global) # type: ignore # Use global scaled data
+            except Exception as e:
+                logger.warning(f"CatBoost failed for {symbol}: {e}. Setting score to 0.")
+                catboost_score = 0.0
+
+            num_trades_to_sample = row.get('oos_bt_total_trades', 0)
+            if num_trades_to_sample == 0:
+                result_row = row.to_dict()
+                result_row['ML_Confirmation_Score'] = 0
+                result_row['LGBM_Score'] = lgbm_score * 100
+                result_row['CatBoost_Score'] = catboost_score * 100
+                ml_results.append(result_row)
+                continue
+
+            oos_df_for_ml = df_symbol.iloc[int(len(df_symbol) * main_params["oos_config"]["in_sample_pct"]):].copy()
+            market_condition_col = f'mc_{row["market_condition"]}'
+            if market_condition_col not in oos_df_for_ml.columns:
+                logger.warning(f"Market condition column {market_condition_col} not found for {symbol}. Skipping row {idx}.")
+                continue
+
+            oos_candles_for_rule_ml = oos_df_for_ml[oos_df_for_ml[market_condition_col]].copy()
+            
+            # Ensure 'volume_level' is present for pattern determination
+            if 'volume_level' not in oos_candles_for_rule_ml.columns:
+                oos_candles_for_rule_ml['volume_level'] = pd.qcut(oos_candles_for_rule_ml['volume'], 3, labels=['low', 'normal', 'high'], duplicates='drop').fillna('normal')
+
+            if 'body_size_threshold' in row and 'wick_size_threshold' in row and 'volume_level' in row:
+                oos_candles_for_rule_ml['actual_pattern'] = determine_candle_pattern_vectorized(
+                    oos_candles_for_rule_ml, row['body_size_threshold'], row['wick_size_threshold']
+                )
+                if 'pattern' in row and row['pattern'] != 'N/A':
+                    oos_candles_for_rule_ml = oos_candles_for_rule_ml[
+                        oos_candles_for_rule_ml['actual_pattern'] == row['pattern']
+                    ]
+
+            if oos_candles_for_rule_ml.empty:
+                result_row = row.to_dict()
+                result_row['ML_Confirmation_Score'] = 0
+                result_row['LGBM_Score'] = lgbm_score * 100
+                result_row['CatBoost_Score'] = catboost_score * 100
+                ml_results.append(result_row)
+                continue
+
+            trade_candidate_indices = oos_candles_for_rule_ml.index.tolist()
+            if len(trade_candidate_indices) > 0:
+                sampled_indices = random.sample(
+                    trade_candidate_indices, min(num_trades_to_sample, len(trade_candidate_indices))
+                )
+                # Ensure trade_dates is based on the *cleaned* and *aligned* df_symbol_clean
+                trade_dates = df_symbol_clean.loc[sampled_indices]
+            else:
+                trade_dates = pd.DataFrame()
+
+
+            # Use probability thresholds (not just 0.5) for classification
+            ML_PROB_THRESHOLD = 0.6  # Set your custom threshold here (can be parameterized)
+            ml_score_points = 0
+            total_possible_points = len(trade_dates) * 3
+            for index, trade_row in trade_dates.iterrows():
+                # Ensure the features extracted here are the same as those used for training
+                trade_row_features = df_symbol_clean.loc[[index]][[
+                    'alma', 'regression_slope', 'atr', 'atr_ma', 'volume',
+                    'log_return', 'normalized_atr', 'log_volume',
+                    'lag1_return', 'lag2_return', 'alma_diff'
+                ]]
+                if trade_row_features.empty:
+                    continue
+
+                # LOF score is not calculated in this snippet, assuming it would be added elsewhere
+                # For now, this part of the scoring might not contribute unless 'lof_score' is present
+                # if 'lof_score' in trade_row and trade_row['lof_score'] == 1:
+                #    ml_score_points += 1
+
+                # Scale the single trade row features before prediction using the global scaler
+                # Ensure scaler_global is defined and fitted from the training step
+                trade_features_scaled = scaler_global.transform(trade_row_features)
+
+                # Convert to dense array if it's a sparse matrix. Pylance might report an issue here, but .toarray() is valid.
+                if isinstance(trade_features_scaled, spmatrix):
+                    trade_features_scaled = trade_features_scaled.toarray() # type: ignore
+
+                # Ensure it's a 2D array for predict_proba if it's a single sample
+                if trade_features_scaled.ndim == 1:
+                    trade_features_scaled = trade_features_scaled.reshape(1, -1)
+
+                if lgbm_score > 0:
+                    # Use explicit probability threshold for LightGBM classification (set ML_PROB_THRESHOLD above)
+                    lgbm_prob = lgbm_model.predict_proba(trade_features_scaled)[0][1]  # type: ignore
+                    if lgbm_prob > ML_PROB_THRESHOLD:
+                        ml_score_points += 1
+
+                if catboost_score > 0:
+                    # Use explicit probability threshold for CatBoost classification (set ML_PROB_THRESHOLD above)
+                    catboost_prob = catboost_model.predict_proba(trade_features_scaled)[0][1]  # type: ignore
+                    if catboost_prob > ML_PROB_THRESHOLD:
+                        ml_score_points += 1
+
+            result_row = row.to_dict()
+            # Adjust total_possible_points if LOF is not contributing
+            adjusted_total_possible_points = len(trade_dates) * (1 + (1 if lgbm_score > 0 else 0) + (1 if catboost_score > 0 else 0))
+            result_row['ML_Confirmation_Score'] = (
+                (ml_score_points / adjusted_total_possible_points) * 100 if adjusted_total_possible_points > 0 else 0
+            )
+            result_row['LGBM_Score'] = lgbm_score * 100
+            result_row['CatBoost_Score'] = catboost_score * 100
+            ml_results.append(result_row)
+
+        df_ml_results = pd.DataFrame(ml_results).sort_values(by="ML_Confirmation_Score", ascending=False)
+        if not df_ml_results.empty:
+            os.makedirs(CONFIG['results_dir'], exist_ok=True)
+            df_ml_results.to_csv(f"{CONFIG['results_dir']}/ES5_ML_Validated_Strategies.csv", index=False)
+            logger.info("Advanced ML validation complete and saved to results/ES5_ML_Validated_Strategies.csv")
+        return df_ml_results
+    except Exception as e:
+        logger.error(f"Error in run_advanced_ml_validation: {e}")
+        return pd.DataFrame()
+
+def run_rl_validation(df_validated_setups, all_prepared_data, main_params):
+    """Enhanced RL validation with adjustments for low drawdown."""
+    logger.info("Starting RL Validation Layer for ES5")
+    if df_validated_setups.empty:
+        logger.warning("No validated setups provided. Skipping RL validation.")
+        return pd.DataFrame()
+
+    rl_params = main_params.get('rl_settings', {
+        'episodes': 10,  # Reduced for 5-minute data efficiency
+        'initial_epsilon': 0.7,
+        'epsilon_decay': 0.99,
+        'min_epsilon': 0.01,
+        'learning_rate': 0.2,
+        'discount_factor': 0.9,
+        'replay_buffer_size': 1000,
+        'batch_size': 32,
+        'q_decay': 0.999
+    })
+
+    scoring_systems = [
+        {'name': 'baseline', 'loss_weight': 1.0, 'drawdown_factor': 2.0, 'sharpe_weight': 0.0}
+    ]
+
+    all_rl_results = []
+    rl_result_keys = None  # Will be set after first result
+
+    for scoring_system in scoring_systems:
+        logger.info(f"Testing scoring system: {scoring_system['name']}")
+        q_table = defaultdict(lambda: np.zeros(5))
+        replay_buffer = deque(maxlen=rl_params['replay_buffer_size'])
+
+        for _, row in df_validated_setups.iterrows():
+            symbol = row["symbol"]
+            df_symbol = all_prepared_data.get(symbol)
+            if df_symbol is None or df_symbol.empty:
+                logger.warning(f"No data for {symbol}. Skipping RL validation.")
+                continue
+
+            df_symbol_rl = df_symbol.copy()
+            df_symbol_rl['day_of_week'] = df_symbol_rl['timestamp'].dt.dayofweek.astype(str)
+            df_symbol_rl['week_of_month'] = ((df_symbol_rl['timestamp'].dt.day - 1) // 7 + 1).astype(str)
+            df_symbol_rl['month'] = df_symbol_rl['timestamp'].dt.month.astype(str)
+            df_symbol_rl['quarter'] = df_symbol_rl['timestamp'].dt.quarter.astype(str)
+            df_symbol_rl['alma_trend'] = calculate_alma_trend(df_symbol_rl).astype(str)
+            market_condition_col = f"mc_{row['market_condition']}"
+            if market_condition_col not in df_symbol_rl.columns:
+                logger.warning(f"Market condition column {market_condition_col} not found for {symbol}. Skipping RL episode.")
+                continue
+            df_symbol_rl['market_condition_type'] = df_symbol_rl[market_condition_col].astype(str)
+            
+            for feature, bins in [('regression_slope', 10), ('normalized_atr', 5)]:
+                if feature in df_symbol_rl.columns:
+                    # Check if the column has enough unique values for qcut
+                    if len(df_symbol_rl[feature].unique()) > bins:
+                        df_symbol_rl[feature] = pd.qcut(df_symbol_rl[feature], bins, labels=False, duplicates='drop').fillna(-1).astype(int).astype(str)
+                    else: # Fallback to cut if not enough unique values for qcut
+                        df_symbol_rl[feature] = pd.cut(df_symbol_rl[feature], bins, labels=False, include_lowest=True, duplicates='drop').fillna(-1).astype(int).astype(str)
+                else:
+                    df_symbol_rl[feature] = "NaN"
+
+            if 'volume_level' not in df_symbol_rl.columns:
+                df_symbol_rl['volume_level'] = pd.qcut(df_symbol_rl['volume'], 3, labels=['low', 'normal', 'high'], duplicates='drop').fillna('normal')
+
+            valid_candles = df_symbol_rl[df_symbol_rl[market_condition_col]].copy()
+            
+            # Ensure 'volume_level' is present for pattern determination
+            if 'volume_level' not in valid_candles.columns:
+                valid_candles['volume_level'] = pd.qcut(valid_candles['volume'], 3, labels=['low', 'normal', 'high'], duplicates='drop').fillna('normal')
+
+            if 'body_size_threshold' in row and 'wick_size_threshold' in row and 'volume_level' in row:
+                valid_candles['actual_pattern'] = determine_candle_pattern_vectorized(
+                    valid_candles, row['body_size_threshold'], row['wick_size_threshold']
+                )
+                if 'pattern' in row and row['pattern'] != 'N/A':
+                    valid_candles = valid_candles[valid_candles['actual_pattern'] == row['pattern']]
+
+            if valid_candles.empty:
+                logger.warning(f"No valid candles for {symbol}. Skipping RL for this rule.")
+                continue
+
+            valid_candles_clean = valid_candles.dropna(subset=[
+                'regression_slope', 'normalized_atr', 'alma_trend', 'market_condition_type', 'volume_level',
+                'day_of_week', 'week_of_month', 'month', 'quarter'
+            ])
+            if valid_candles_clean.empty:
+                logger.warning(f"No valid candles for {symbol} after state feature cleaning. Skipping RL for this rule.")
+                continue
+
+            tp_pct = row.get('take_profit_pct', 0.5)
+            sl_pct = row.get('stop_loss_pct', 0.25)
+            ml_score = row.get('ML_Confirmation_Score', 0)
+
+            for episode in range(rl_params['episodes']):
+                epsilon = max(rl_params['min_epsilon'], rl_params['initial_epsilon'] * (rl_params['epsilon_decay'] ** episode))
+                equity = 10000
+                position = 0
+                entry_price = 0
+                total_profit = 0
+                trades = []
+                max_drawdown = 0
+                peak_equity = equity
+                returns = []
+
+                for i in range(len(valid_candles_clean) - 1):
+                    current_idx = valid_candles_clean.index[i]
+                    next_idx = valid_candles_clean.index[i + 1]
+                    state = create_state(df_symbol_rl, df_symbol_rl.index.get_loc(current_idx), [
+                        'regression_slope', 'normalized_atr', 'alma_trend', 'market_condition_type', 'volume_level',
+                        'day_of_week', 'week_of_month', 'month', 'quarter'
+                    ])
+                    next_state = create_state(df_symbol_rl, df_symbol_rl.index.get_loc(next_idx), [
+                        'regression_slope', 'normalized_atr', 'alma_trend', 'market_condition_type', 'volume_level',
+                        'day_of_week', 'week_of_month', 'month', 'quarter'
+                    ])
+
+                    action = np.random.randint(5) if random.random() < epsilon else np.argmax(q_table[state])
+                    reward = 0
+                    trade_profit = 0
+                    
+                    current_close = df_symbol_rl['close'].loc[current_idx]
+                    next_close = df_symbol_rl['close'].loc[next_idx]
+                    next_high = df_symbol_rl['high'].loc[next_idx]
+                    next_low = df_symbol_rl['low'].loc[next_idx]
+
+                    if action == 0:
+                        if position == 0:
+                            reward = -0.0001 if df_symbol_rl['mc_trendingUp'].loc[current_idx] or df_symbol_rl['mc_trendingDown'].loc[current_idx] else 0
+                        else:
+                            price_change = (next_close - current_close) / current_close if position == 1 else (current_close - next_close) / current_close
+                            reward = price_change * entry_price / 10000
+                    elif action == 1 and position == 0:
+                        entry_price = current_close
+                        position = 1
+                        reward = -0.01 * entry_price / 10000
+                    elif action == 2 and position == 0:
+                        entry_price = current_close
+                        position = -1
+                        reward = -0.01 * entry_price / 10000
+                    elif action == 3 and position == 1:
+                        exit_price = next_close
+                        trade_profit = exit_price - entry_price
+                        total_profit += trade_profit
+                        trades.append(trade_profit)
+                        equity += trade_profit
+                        returns.append(trade_profit / entry_price if entry_price != 0 else 0)
+                        position = 0
+                        reward = trade_profit
+                    elif action == 4 and position == -1:
+                        exit_price = next_close
+                        trade_profit = entry_price - exit_price
+                        total_profit += trade_profit
+                        trades.append(trade_profit)
+                        equity += trade_profit
+                        returns.append(trade_profit / entry_price if entry_price != 0 else 0)
+                        position = 0
+                        reward = trade_profit
+
+                    if position != 0 and entry_price != 0:
+                        if position == 1:
+                            sl_price = entry_price * (1 - sl_pct / 100)
+                            tp_price = entry_price * (1 + tp_pct / 100)
+                            if next_low <= sl_price:
+                                trade_profit_exit = (sl_price - entry_price)
+                                total_profit += trade_profit_exit
+                                trades.append(trade_profit_exit)
+                                equity += trade_profit_exit
+                                returns.append(trade_profit_exit / entry_price)
+                                position = 0
+                                reward = reward + trade_profit_exit if action not in [3,4] else trade_profit_exit
+                            elif next_high >= tp_price:
+                                trade_profit_exit = (tp_price - entry_price)
+                                total_profit += trade_profit_exit
+                                trades.append(trade_profit_exit)
+                                equity += trade_profit_exit
+                                returns.append(trade_profit_exit / entry_price)
+                                position = 0
+                                reward = reward + trade_profit_exit if action not in [3,4] else trade_profit_exit
+                        elif position == -1:
+                            sl_price = entry_price * (1 + sl_pct / 100)
+                            tp_price = entry_price * (1 - tp_pct / 100)
+                            if next_high >= sl_price:
+                                trade_profit_exit = (entry_price - sl_price)
+                                total_profit += trade_profit_exit
+                                trades.append(trade_profit_exit)
+                                equity += trade_profit_exit
+                                returns.append(trade_profit_exit / entry_price)
+                                position = 0
+                                reward = reward + trade_profit_exit if action not in [3,4] else trade_profit_exit
+                            elif next_low <= tp_price:
+                                trade_profit_exit = (entry_price - tp_price)
+                                total_profit += trade_profit_exit
+                                trades.append(trade_profit_exit)
+                                equity += trade_profit_exit
+                                returns.append(trade_profit_exit / entry_price)
+                                position = 0
+                                reward = reward + trade_profit_exit if action not in [3,4] else trade_profit_exit
+                    
+                    peak_equity = max(peak_equity, equity)
+                    drawdown = (peak_equity - equity) / peak_equity if peak_equity > 0 else 0
+                    max_drawdown = max(max_drawdown, drawdown)
+
+                    if trade_profit != 0:
+                        final_reward = trade_profit
+                        if scoring_system['name'] == 'loss_penalized' and trade_profit < 0:
+                            final_reward *= scoring_system['loss_weight']
+                        if scoring_system['name'] == 'drawdown_sensitive':
+                            final_reward *= (1 - max_drawdown * scoring_system['drawdown_factor'])
+                        final_reward *= (1 + (ml_score / 50))
+                        reward = final_reward
+                    elif action not in [3,4] and position == 0 and trade_profit == 0:
+                        reward = -0.001
+                    
+                    reward = 0 if pd.isna(reward) else reward
+                    replay_buffer.append((state, action, reward, next_state))
+                    old_q_value = q_table[state][action]
+                    max_future_q = np.max(q_table[next_state])
+                    new_q_value = old_q_value + rl_params['learning_rate'] * (reward + rl_params['discount_factor'] * max_future_q - old_q_value)
+                    q_table[state][action] = new_q_value
+
+                    if len(replay_buffer) >= rl_params['batch_size']:
+                        batch = random.sample(replay_buffer, rl_params['batch_size'])
+                        for s_b, a_b, r_b, ns_b in batch:
+                            old_q_value_b = q_table[s_b][a_b]
+                            max_future_q_b = np.max(q_table[ns_b])
+                            new_q_value_b = old_q_value_b + rl_params['learning_rate'] * (r_b + rl_params['discount_factor'] * max_future_q_b - old_q_value_b)
+                            q_table[s_b][a_b] = new_q_value_b
+
+                    if (i + 1) % 10 == 0:
+                        for s_decay in list(q_table.keys()):
+                            q_table[s_decay] *= rl_params['q_decay']
+
+                if (episode + 1) % 10 == 0:
+                    logger.info(f"Symbol: {symbol}, Scoring: {scoring_system['name']}, Episode: {episode + 1}, Total Profit: {total_profit:.2f}, Trades: {len(trades)}")
+
+            num_wins = sum(1 for t in trades if t > 0)
+            # Ensure rl_result is a flat dict with only serializable values
+            rl_result = row.to_dict().copy()
+            # Convert all values to basic types or string
+            for k, v in list(rl_result.items()):
+                if isinstance(v, (dict, pd.DataFrame, pd.Series, list, tuple, set)):
+                    rl_result[k] = str(v)
+                elif not isinstance(v, (str, float, int, bool, type(None))):
+                    rl_result[k] = str(v)
+            rl_result['RL_Total_Profit'] = float(total_profit)
+            rl_result['RL_Win_Rate'] = float((num_wins / len(trades) * 100) if trades else 0)
+            rl_result['RL_Trades'] = json.dumps([float(t) for t in trades])
+            rl_result['RL_Max_Drawdown'] = float(max_drawdown * 100)
+            rl_result['Scoring_System'] = str(scoring_system['name'])
+            all_rl_results.append(rl_result)
+
+    # --- Ensure all RL results have the same columns and are serializable ---
+    # 1. Collect all possible keys
+    all_keys = set()
+    for res in all_rl_results:
+        all_keys.update(res.keys())
+    all_keys = list(all_keys)
+
+    # 2. Flatten and fill missing keys, convert all values to serializable types
+    flat_results = []
+    for res in all_rl_results:
+        flat = {}
+        for k in all_keys:
+            v = res.get(k, None)
+            # Flatten nested or non-serializable types
+            if isinstance(v, (dict, pd.DataFrame, pd.Series, list, tuple, set)):
+                flat[k] = str(v)
+            elif not isinstance(v, (str, float, int, bool, type(None))):
+                flat[k] = str(v)
+            else:
+                flat[k] = v
+        flat_results.append(flat)
+
+    df_rl_results = pd.DataFrame(flat_results, columns=all_keys)
+    if not df_rl_results.empty:
+        os.makedirs(CONFIG['results_dir'], exist_ok=True)
+        df_rl_results.to_csv(f"{CONFIG['results_dir']}/ES5_RL_Validated_Strategies.csv", index=False)
+        logger.info("RL validation complete and saved to results/ES5_RL_Validated_Strategies.csv")
+    return df_rl_results
+
+def run_bayesian_validation(df_validated_setups, all_prepared_data, main_params):
+    """Runs Bayesian regression on OOS backtest results for uncertainty estimation."""
+    try:
+        from sklearn.linear_model import BayesianRidge
+        logger.info("Starting Bayesian Regression Validation for ES5")
+        if df_validated_setups.empty:
+            logger.warning("No validated setups for Bayesian validation")
+            return pd.DataFrame()
+
+        bayes_results = []
+        for _, row in df_validated_setups.iterrows():
+            symbol = row["symbol"]
+            df_symbol = all_prepared_data.get(symbol)
+            if df_symbol is None or df_symbol.empty:
+                logger.warning(f"No data for {symbol} in Bayesian validation. Skipping.")
+                continue
+
+            # Use same features as ML validation for consistency
+            features = [
+                'alma', 'regression_slope', 'atr', 'atr_ma', 'volume',
+                'log_return', 'normalized_atr', 'log_volume'
+            ]
+            df_symbol_clean = df_symbol.dropna(subset=features).copy()
+            if df_symbol_clean.empty:
+                logger.warning(f"No clean data for {symbol} in Bayesian validation. Skipping.")
+                continue
+
+            X = df_symbol_clean[features]
+            # Target: next return (regression)
+            df_symbol_clean['next_return'] = df_symbol_clean['close'].pct_change().shift(-1)
+            y = df_symbol_clean['next_return'].dropna()
+            X = X.loc[y.index]
+            if len(X) < 50:
+                logger.warning(f"Insufficient data for {symbol} in Bayesian validation. Skipping.")
+                continue
+
+            # Fit Bayesian Ridge Regression
+            model = BayesianRidge()
+            model.fit(X, y)
+            y_pred, y_std = model.predict(X, return_std=True) # type: ignore
+            y_pred = np.asarray(y_pred)
+            y_std = np.asarray(y_std)
+            mean_score = np.mean(np.asarray(y_pred))
+            std_score = np.mean(np.asarray(y_std))
+            bayes_results.append({
+                **row.to_dict(),
+                'Bayesian_Score': mean_score / (std_score + 1e-8),
+                'Bayesian_Mean': mean_score,
+                'Bayesian_Std': std_score
+            })
+
+        df_bayes = pd.DataFrame(bayes_results).sort_values(by="Bayesian_Score", ascending=False)
+        if not df_bayes.empty:
+            os.makedirs(CONFIG['results_dir'], exist_ok=True)
+            df_bayes.to_csv(f"{CONFIG['results_dir']}/ES5_Bayesian_Validated_Strategies.csv", index=False)
+            logger.info("Bayesian validation complete and saved to results/ES5_Bayesian_Validated_Strategies.csv")
+        return df_bayes
+    except Exception as e:
+        logger.error(f"Error in run_bayesian_validation: {e}")
+        return pd.DataFrame()
+
+
+def verify_with_backtest(df_ml_results, df_rl_results, all_prepared_data, transaction_cost=0.001):
+    """Verifies ML and RL strategies with a backtest."""
+    logger.info("Starting backtest verification for ML and RL strategies for ES5")
+    
+    ml_backtest_results = {'total_profit': 0, 'win_rate': 0, 'max_drawdown': 0, 'total_trades': 0, 'trades': '[]'}
+    rl_backtest_results = {'total_profit': 0, 'win_rate': 0, 'max_drawdown': 0, 'total_trades': 0, 'trades': '[]'}
+
+    if not df_ml_results.empty:
+        top_ml_strategy = df_ml_results.sort_values(by="ML_Confirmation_Score", ascending=False).iloc[0]
+        symbol = top_ml_strategy['symbol']
+        df = all_prepared_data.get(symbol)
+        if df is not None and not df.empty:
+            market_condition_col = f"mc_{top_ml_strategy['market_condition']}"
+            filtered_df = df[df[market_condition_col]].copy()
+            
+            # Ensure 'volume_level' is present for pattern determination
+            if 'volume_level' not in filtered_df.columns:
+                filtered_df['volume_level'] = pd.qcut(filtered_df['volume'], 3, labels=['low', 'normal', 'high'], duplicates='drop').fillna('normal')
+
+            if 'body_size_threshold' in top_ml_strategy and 'wick_size_threshold' in top_ml_strategy and 'volume_level' in top_ml_strategy:
+                filtered_df['actual_pattern'] = determine_candle_pattern_vectorized(
+                    filtered_df, top_ml_strategy['body_size_threshold'], top_ml_strategy['wick_size_threshold']
+                )
+                if 'pattern' in top_ml_strategy and top_ml_strategy['pattern'] != 'N/A':
+                    filtered_df = filtered_df[filtered_df['actual_pattern'] == top_ml_strategy['pattern']]
+            if not filtered_df.empty:
+                bt_params = top_ml_strategy.to_dict()
+                ml_backtest_results = backtest_strategy(filtered_df, bt_params, transaction_cost)
+            else:
+                logger.warning(f"No filtered data for ML backtest for {symbol}")
+        else:
+            logger.warning(f"No prepared data for {symbol} for ML backtest.")
+
+    if not df_rl_results.empty:
+        top_rl_strategy = df_rl_results.sort_values(by="RL_Total_Profit", ascending=False).iloc[0]
+        symbol = top_rl_strategy['symbol']
+        df = all_prepared_data.get(symbol)
+        if df is not None and not df.empty:
+            market_condition_col = f"mc_{top_rl_strategy['market_condition']}"
+            filtered_df = df[df[market_condition_col]].copy()
+            
+            # Ensure 'volume_level' is present for pattern determination
+            if 'volume_level' not in filtered_df.columns:
+                filtered_df['volume_level'] = pd.qcut(filtered_df['volume'], 3, labels=['low', 'normal', 'high'], duplicates='drop').fillna('normal')
+
+            if 'body_size_threshold' in top_rl_strategy and 'wick_size_threshold' in top_rl_strategy and 'volume_level' in top_rl_strategy:
+                filtered_df['actual_pattern'] = determine_candle_pattern_vectorized(
+                    filtered_df, top_rl_strategy['body_size_threshold'], top_rl_strategy['wick_size_threshold']
+                )
+                if 'pattern' in top_rl_strategy and top_rl_strategy['pattern'] != 'N/A':
+                    filtered_df = filtered_df[filtered_df['actual_pattern'] == top_rl_strategy['pattern']]
+            if not filtered_df.empty:
+                bt_params = top_rl_strategy.to_dict()
+                rl_backtest_results = backtest_strategy(filtered_df, bt_params, transaction_cost)
+            else:
+                logger.warning(f"No filtered data for RL backtest for {symbol}")
+        else:
+            logger.warning(f"No prepared data for {symbol} for RL backtest.")
+
+    return ml_backtest_results, rl_backtest_results
+
+def filter_top_patterns(df_ml_results, df_rl_results, df_mc_results, df_validated, data_source, main_params, num_strategies=8):
+    """Filters top 5-8 patterns based on RL and ML validation, prioritizing low drawdown."""
+    try:
+        logger.info(f"Filtering top {num_strategies} patterns for ES5")
+        if df_rl_results.empty and df_ml_results.empty:
+            logger.warning("No RL or ML results to filter")
+            return pd.DataFrame()
+
+        df_combined = df_rl_results.copy()
+        if not df_ml_results.empty:
+            df_combined = df_combined.merge(
+                df_ml_results[['rule_code', 'ML_Confirmation_Score', 'LGBM_Score', 'CatBoost_Score']],
+                on='rule_code', how='left', suffixes=('', '_ml')
+            ).fillna({'ML_Confirmation_Score': 0, 'LGBM_Score': 0, 'CatBoost_Score': 0})
+
+        if main_params.get("bayesian_enabled", False):
+            df_bayes_results = run_bayesian_validation(df_validated, data_source, main_params)
+            if not df_bayes_results.empty:
+                logger.info(f"Bayesian validation produced {len(df_bayes_results)} results")
+                logger.info(f"Top Bayesian result: {df_bayes_results.iloc[0][['Bayesian_Score','Bayesian_Mean','Bayesian_Std']].to_dict()}")
+            else:
+                logger.info("No Bayesian validation results.")
+        else:
+            df_bayes_results = pd.DataFrame()
+        if not df_mc_results.empty:
+            df_combined = df_combined.merge(
+                df_mc_results[['rule_code', 'mc_prob_of_profit', 'mc_avg_final_profit']],
+                on='rule_code', how='left'
+            ).fillna({'mc_prob_of_profit': 50, 'mc_avg_final_profit': 0})
+
+        df_combined['norm_rl_profit'] = np.log1p(df_combined['RL_Total_Profit'].clip(lower=0)) / np.log1p(10000)
+        df_combined['norm_rl_drawdown'] = df_combined['RL_Max_Drawdown'] / 100.0
+        df_combined['norm_ml_score'] = df_combined['ML_Confirmation_Score'] / 100.0
+        df_combined['combined_score'] = (
+            0.5 * df_combined['norm_rl_profit'] +
+            0.3 * df_combined['norm_ml_score'] +
+            0.2 * (1 - df_combined['norm_rl_drawdown'])
+        )
+
+        if 'mc_prob_of_profit' in df_combined.columns:
+            df_combined = df_combined[df_combined['mc_prob_of_profit'] > 50]
+
+        df_combined = df_combined[df_combined['ML_Confirmation_Score'] > 50]
+
+        df_top_patterns = df_combined.sort_values(by='combined_score', ascending=False).head(num_strategies)
+        if df_top_patterns.empty:
+            logger.warning("No patterns meet filtering criteria")
+            return pd.DataFrame()
+
+        df_top_patterns = df_top_patterns[df_top_patterns['pattern'].isin(['Hammer', 'Doji', 'ShootingStar', 'Custom'])]
+        if len(df_top_patterns) < 5:
+            logger.warning(f"Only {len(df_top_patterns)} valid patterns found, expected 5-8")
+
+        os.makedirs(CONFIG['results_dir'], exist_ok=True)
+        df_top_patterns.to_csv(f"{CONFIG['results_dir']}/ES5_Top_Patterns.csv", index=False)
+        logger.info(f"Top {len(df_top_patterns)} patterns saved to results/ES5_Top_Patterns.csv")
+        return df_top_patterns
+    except Exception as e:
+        logger.error(f"Error in filter_top_patterns: {e}")
+        return pd.DataFrame()
+
+def test_strategy():
+    """Tests the strategy for ES5 on 5-minute timeframe."""
+    logger.info("Starting test of strategy components for ES5 on 5-minute timeframe")
+    
+    test_params = {
+        "num_trades": 200,  # Increased for 5-minute data
+        "simulated_win_rate": 0.55,
+        "top_n_to_validate": 5,
+        "indicator_settings": THINKSCRIPT_PARAMS,
+        "ml_settings": {
+            "lof_k": 20
+        },
+        "oos_config": {
+            "enabled": True,
+            "in_sample_pct": 0.75
+        },
+        "monte_carlo_config": {
+            "enabled": True,
+            "simulations": 1000,
+            "top_n_for_mc": 5
+        },
+        "rl_settings": {
+            "episodes": 10,  # Reduced for efficiency
+            "initial_epsilon": 0.7,
+            "epsilon_decay": 0.99,
+            'min_epsilon': 0.01,
+            'learning_rate': 0.2,
+            'discount_factor': 0.9,
+            'replay_buffer_size': 1000,
+            'batch_size': 23,
+            'q_decay': 0.999
+        },
+        "random_seed": 42
+    }
+
+    symbol = "ES5"
+    df = load_candlestick_data(symbol)
+    if df.empty:
+        logger.error(f"Failed to load 5-minute data for {symbol}")
+        return
+
+    df = calculate_standard_indicators(df, test_params['indicator_settings'])
+    df = pre_calculate_market_conditions(df, test_params['indicator_settings'])
+    df['symbol'] = symbol
+    test_data = {symbol: df}
+
+    logger.info(f"Testing indicators for {symbol} on 5-minute timeframe")
+    assert 'alma' in df.columns, "ALMA indicator missing"
+    assert 'regression_slope' in df.columns, "Regression slope missing"
+    assert 'atr' in df.columns, "ATR indicator missing"
+    assert 'volume_level' in df.columns, "Volume level missing"
+    logger.info(f"ALMA mean: {df['alma'].mean():.2f}")
+    logger.info(f"Regression slope mean: {df['regression_slope'].mean():.6f}")
+    logger.info(f"ATR mean: {df['atr'].mean():.2f}")
+    logger.info(f"Trending Up candles: {df['mc_trendingUp'].sum()}")
+    logger.info(f"Volume level distribution: {df['volume_level'].value_counts().to_dict()}")
+
+    logger.info("Running test simulation for ES5 on 5-minute timeframe")
+    df_simulation = run_simulation(test_params, test_data)
+    if not df_simulation.empty:
+        logger.info(f"Full simulation produced {len(df_simulation)} results")
+
+        # --- Output top 10 setups and all simulated trades to CSV ---
+        try:
+            top10 = df_simulation.sort_values(by="score", ascending=False).head(10)
+            os.makedirs(CONFIG['results_dir'], exist_ok=True)
+            top10.to_csv(os.path.join(CONFIG['results_dir'], "top10_setups.csv"), index=False)
+            logger.info("Top 10 setups saved to results/top10_setups.csv")
+
+            all_trades = []
+            for _, row in df_simulation.iterrows():
+                rule_code = row.get("rule_code", "")
+                trades_json = row.get("returns", "[]")
+                try:
+                    trades = json.loads(trades_json)
+                except Exception:
+                    trades = []
+                for trade in trades:
+                    all_trades.append({
+                        "rule_code": rule_code,
+                        "trade_return": trade
+                    })
+            df_all_trades = pd.DataFrame(all_trades)
+            df_all_trades.to_csv(os.path.join(CONFIG['results_dir'], "all_simulated_trades.csv"), index=False)
+            logger.info("All simulated trades saved to results/all_simulated_trades.csv")
+        except Exception as e:
+            logger.error(f"Error saving top 10 setups or all simulated trades: {e}")
+
+        # Continue with the rest of the workflow if needed
+        df_validated = run_oos_validation(df_simulation, test_data, test_params["oos_config"], test_params)
+        if not df_validated.empty:
+            df_mc_results = run_monte_carlo_analysis(df_validated, test_params["monte_carlo_config"]) if test_params["monte_carlo_config"]["enabled"] else pd.DataFrame()
+            if not df_mc_results.empty:
+                logger.info("Monte Carlo results saved to results/ES5_MonteCarloAnalysis.csv")
+            df_ml_results = run_advanced_ml_validation(df_validated, test_data, test_params)
+            if not df_ml_results.empty:
+                logger.info("ML validation results saved to results/ES5_ML_Validated_Strategies.csv")
+            df_rl_results = run_rl_validation(df_validated, test_data, test_params)
+            if not df_rl_results.empty:
+                logger.info("RL validation results saved to results/ES5_RL_Validated_Strategies.csv")
+            df_top_patterns = filter_top_patterns(df_ml_results, df_rl_results, df_mc_results, df_validated, test_data, main_params, num_strategies=8)
+            if not df_top_patterns.empty:
+                logger.info(f"Filtered {len(df_top_patterns)} top patterns. Saved to results/ES5_Top_Patterns.csv")
+            else:
+                logger.warning("No top patterns filtered")
+        else:
+            logger.warning("No OOS validation results")
+    else:
+        logger.warning("No simulation results")
+
+    logger.info("Test completed")
+
+cpu_regulator = CPURegulator(max_cpu=45)
+# Main Execution
+if __name__ == "__main__":
+    main_params = {
+        "num_trades": 500,  # Suitable for 5-minute ES5 data
+        "simulated_win_rate": 0.55,
+        "top_n_to_validate": 50,
+        "indicator_settings": THINKSCRIPT_PARAMS,
+        "ml_settings": {
+            "lof_k": 20
+        },
+        "oos_config": {
+            "enabled": True,
+            "in_sample_pct": 0.60
+        },
+        "monte_carlo_config": {
+            "enabled": True,
+            "simulations": 1000,
+            "top_n_for_mc": 50
+        },
+        "rl_settings": {
+            "episodes": 30,  # Reduced for efficiency with 5-minute data
+            "initial_epsilon": 0.7,
+            "epsilon_decay": 0.99,
+            'min_epsilon': 0.01,
+            'learning_rate': 0.2,
+            'discount_factor': 0.9,
+            'replay_buffer_size': 1000,
+            'batch_size': 32,
+            'q_decay': 0.999
+        },
+        "random_seed": 42,
+        "bayesian_enabled": True
+    }
+
+    start_time = time.time()
+    
+    test_strategy()
+
+    logger.info("Starting full simulation for ES5 on 5-minute timeframe")
+    symbol = "ES5"
+    df = load_candlestick_data(symbol)
+    if df.empty:
+        logger.error(f"Failed to load 5-minute data for {symbol}")
+    else:
+        df = calculate_standard_indicators(df, main_params['indicator_settings'])
+        df = pre_calculate_market_conditions(df, main_params['indicator_settings'])
+        df['symbol'] = symbol
+        data_source = {symbol: df}
+        
+        df_simulation = run_simulation(main_params, data_source)
+        if not df_simulation.empty:
+            logger.info(f"Full simulation produced {len(df_simulation)} results")
+
+            # --- Output top 10 setups and all simulated trades to CSV ---
+            try:
+                df_top10 = df_simulation.sort_values(by="score", ascending=False).head(10)
+                df_top10.to_csv("results/top10_setups.csv", index=False)
+                logger.info("Saved top 10 setups to results/top10_setups.csv")
+
+                trades_records = []
+                for _, row in df_simulation.iterrows():
+                    rule_code = row.get("rule_code", "")
+                    try:
+                        trade_list = json.loads(row.get("returns", "[]"))
+                    except Exception:
+                        trade_list = []
+                    for trade_val in trade_list:
+                        trades_records.append({
+                            "rule_code": rule_code,
+                            "trade_value": trade_val
+                        })
+                if trades_records:
+                    df_trades = pd.DataFrame(trades_records)
+                    df_trades.to_csv("results/all_simulated_trades.csv", index=False)
+                    logger.info("Saved all simulated trades to results/all_simulated_trades.csv")
+                else:
+                    logger.info("No trades found to save.")
+            except Exception as e:
+                logger.error(f"Error exporting top 10 setups or trades: {e}")
+
+            # Continue with the rest of the workflow if needed
+            df_validated = run_oos_validation(df_simulation, data_source, main_params["oos_config"], main_params)
+            if not df_validated.empty:
+                df_mc_results = run_monte_carlo_analysis(df_validated, main_params["monte_carlo_config"]) if main_params["monte_carlo_config"]["enabled"] else pd.DataFrame()
+                df_ml_results = run_advanced_ml_validation(df_validated, data_source, main_params)
+                df_rl_results = run_rl_validation(df_validated, data_source, main_params)
+                df_top_patterns = filter_top_patterns(df_ml_results, df_rl_results, df_mc_results, df_validated, data_source, main_params, num_strategies=8)
+                if not df_top_patterns.empty:
+                    logger.info(f"Final top patterns: {len(df_top_patterns)} strategies saved to results/ES5_Top_Patterns.csv")
+                else:
+                    logger.warning("No top patterns filtered")
+            else:
+                logger.warning("No OOS validation results")
+        else:
+            logger.warning("No simulation results")
+    
+    logger.info(f"Total execution time: {time.time() - start_time:.2f} seconds")
